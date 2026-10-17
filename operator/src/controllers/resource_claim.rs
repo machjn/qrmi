@@ -21,17 +21,15 @@ use std::time::Duration;
 use anyhow::Result;
 use chrono::Utc;
 use k8s_openapi::api::core::v1::Secret;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta as K8sObjectMeta;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::{Api, Client, ResourceExt};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::acquire;
-use crate::crd::{
-    ClaimPhase, QuantumResource, QuantumResourceClaim, QuantumResourceClaimStatus,
-};
+use crate::crd::{ClaimPhase, QuantumResource, QuantumResourceClaim, QuantumResourceClaimStatus};
 use crate::error::ControllerError;
 
 const FINALIZER: &str = "quantum.qrmi.io/finalizer";
@@ -174,7 +172,11 @@ async fn handle_pending(
         }
     };
 
-    let secret_name = claim.spec.secret_name.clone().unwrap_or_else(|| secret_name_for(&claim.name_any()));
+    let secret_name = claim
+        .spec
+        .secret_name
+        .clone()
+        .unwrap_or_else(|| secret_name_for(&claim.name_any()));
     let resource_prefix = qr.spec.resource_id.to_lowercase().replace('-', "_");
     let mut secret_data: BTreeMap<String, String> = env_vars
         .clone()
@@ -224,11 +226,12 @@ async fn handle_bound(
     };
 
     if let Some(expires_at_str) = &status.expires_at {
-        if let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(expires_at_str).map(|dt| dt.with_timezone(&Utc)) {
+        if let Ok(expires_at) =
+            chrono::DateTime::parse_from_rfc3339(expires_at_str).map(|dt| dt.with_timezone(&Utc))
+        {
             if Utc::now() >= expires_at {
                 info!(claim = %claim.name_any(), "TTL expired; deleting claim");
-                let claims_api: Api<QuantumResourceClaim> =
-                    Api::namespaced(ctx.client.clone(), ns);
+                let claims_api: Api<QuantumResourceClaim> = Api::namespaced(ctx.client.clone(), ns);
                 claims_api
                     .delete(&claim.name_any(), &Default::default())
                     .await?;
@@ -250,7 +253,11 @@ async fn handle_bound(
 
 async fn cleanup(claim: &QuantumResourceClaim, ctx: &Arc<Context>) -> Result<()> {
     let ns = claim.namespace().unwrap_or_default();
-    let secret_name = claim.spec.secret_name.clone().unwrap_or_else(|| secret_name_for(&claim.name_any()));
+    let secret_name = claim
+        .spec
+        .secret_name
+        .clone()
+        .unwrap_or_else(|| secret_name_for(&claim.name_any()));
     let secrets_api: Api<Secret> = Api::namespaced(ctx.client.clone(), &ns);
 
     if let Some(status) = &claim.status {
@@ -265,12 +272,10 @@ async fn cleanup(claim: &QuantumResourceClaim, ctx: &Arc<Context>) -> Result<()>
                     if let Some(data) = &secret.data {
                         if let Some(token_bytes) = data.get(&token_key) {
                             if let Ok(token) = String::from_utf8(token_bytes.0.clone()) {
-                                let env_vars =
-                                    acquire::resolve_env_vars(&qr.spec, &secrets_api)
-                                        .await
-                                        .unwrap_or_default();
-                                if let Err(e) =
-                                    acquire::release(&qr.spec, &env_vars, &token).await
+                                let env_vars = acquire::resolve_env_vars(&qr.spec, &secrets_api)
+                                    .await
+                                    .unwrap_or_default();
+                                if let Err(e) = acquire::release(&qr.spec, &env_vars, &token).await
                                 {
                                     warn!(claim = %claim.name_any(), "release failed (continuing cleanup): {e}");
                                 } else {
@@ -284,10 +289,7 @@ async fn cleanup(claim: &QuantumResourceClaim, ctx: &Arc<Context>) -> Result<()>
         }
     }
 
-    if let Err(e) = secrets_api
-        .delete(&secret_name, &Default::default())
-        .await
-    {
+    if let Err(e) = secrets_api.delete(&secret_name, &Default::default()).await {
         if !is_not_found(&e) {
             warn!("failed to delete Secret {secret_name}: {e}");
         }
@@ -316,8 +318,12 @@ async fn add_finalizer(
     let patch = serde_json::json!({
         "metadata": { "finalizers": [FINALIZER] }
     });
-    api.patch(name, &PatchParams::apply("qrmi-operator"), &Patch::Merge(&patch))
-        .await?;
+    api.patch(
+        name,
+        &PatchParams::apply("qrmi-operator"),
+        &Patch::Merge(&patch),
+    )
+    .await?;
     Ok(())
 }
 
@@ -335,8 +341,12 @@ async fn remove_finalizer(
         .filter(|f| f != FINALIZER)
         .collect();
     let patch = serde_json::json!({ "metadata": { "finalizers": finalizers } });
-    api.patch(name, &PatchParams::apply("qrmi-operator"), &Patch::Merge(&patch))
-        .await?;
+    api.patch(
+        name,
+        &PatchParams::apply("qrmi-operator"),
+        &Patch::Merge(&patch),
+    )
+    .await?;
     Ok(())
 }
 
@@ -376,10 +386,7 @@ async fn create_or_update_secret(
                     "app.kubernetes.io/managed-by".to_string(),
                     "qrmi-operator".to_string(),
                 ),
-                (
-                    "quantum.qrmi.io/claim".to_string(),
-                    owner.name_any(),
-                ),
+                ("quantum.qrmi.io/claim".to_string(), owner.name_any()),
             ])),
             ..Default::default()
         },
@@ -431,5 +438,3 @@ async fn patch_status(
 fn is_not_found(e: &kube::Error) -> bool {
     matches!(e, kube::Error::Api(r) if r.code == 404)
 }
-
-

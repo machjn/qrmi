@@ -25,13 +25,13 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use rustls;
 use futures::future::join_all;
 use futures::StreamExt;
 use k8s_openapi::api::batch::v1::Job;
 use kube::runtime::watcher::Config as WatcherConfig;
 use kube::runtime::Controller;
 use kube::{Api, Client, CustomResourceExt};
+use rustls;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -114,7 +114,9 @@ async fn run_operator() -> Result<()> {
                 Err(e) => {
                     let msg = e.to_string();
                     if msg.contains("not found in local store") {
-                        tracing::debug!("job reconcile skipped (object deleted before cache update): {msg}");
+                        tracing::debug!(
+                            "job reconcile skipped (object deleted before cache update): {msg}"
+                        );
                     } else {
                         tracing::warn!("job reconcile error: {e}");
                     }

@@ -74,9 +74,10 @@ pub async fn resolve_env_vars(
 
 /// Read a single key from a Kubernetes Secret, base64-decoded.
 async fn read_secret_key(api: &Api<Secret>, secret_name: &str, key: &str) -> Result<String> {
-    let secret = api.get(secret_name).await.with_context(|| {
-        format!("getting Secret {secret_name}")
-    })?;
+    let secret = api
+        .get(secret_name)
+        .await
+        .with_context(|| format!("getting Secret {secret_name}"))?;
     let data = secret
         .data
         .ok_or_else(|| anyhow::anyhow!("Secret {secret_name} has no data"))?;
@@ -195,36 +196,27 @@ async fn do_release(spec: &QuantumResourceSpec, token: &str) -> Result<()> {
 fn build_backend(spec: &QuantumResourceSpec) -> Result<Box<dyn QuantumResource>> {
     let id = &spec.resource_id;
     let backend: Box<dyn QuantumResource> = match spec.resource_type {
-        QrmiResourceType::IbmQuantumSystem => {
-            Box::new(IBMQuantumSystem::new(id).with_context(|| {
-                format!("constructing IBMQuantumSystem for {id}")
-            })?)
-        }
-        QrmiResourceType::QiskitRuntimeService => {
-            Box::new(IBMQiskitRuntimeService::new(id).with_context(|| {
-                format!("constructing IBMQiskitRuntimeService for {id}")
-            })?)
-        }
-        QrmiResourceType::PasqalCloud => {
-            Box::new(PasqalCloud::new(id).with_context(|| {
-                format!("constructing PasqalCloud for {id}")
-            })?)
-        }
-        QrmiResourceType::PasqalLocal => {
-            Box::new(PasqalLocal::new(id).with_context(|| {
-                format!("constructing PasqalLocal for {id}")
-            })?)
-        }
-        QrmiResourceType::AliceBobFelis => {
-            Box::new(AliceBobFelis::new(id).with_context(|| {
-                format!("constructing AliceBobFelis for {id}")
-            })?)
-        }
-        QrmiResourceType::IqmServer => {
-            Box::new(IQMServer::new(id).with_context(|| {
-                format!("constructing IQMServer for {id}")
-            })?)
-        }
+        QrmiResourceType::IbmQuantumSystem => Box::new(
+            IBMQuantumSystem::new(id)
+                .with_context(|| format!("constructing IBMQuantumSystem for {id}"))?,
+        ),
+        QrmiResourceType::QiskitRuntimeService => Box::new(
+            IBMQiskitRuntimeService::new(id)
+                .with_context(|| format!("constructing IBMQiskitRuntimeService for {id}"))?,
+        ),
+        QrmiResourceType::PasqalCloud => Box::new(
+            PasqalCloud::new(id).with_context(|| format!("constructing PasqalCloud for {id}"))?,
+        ),
+        QrmiResourceType::PasqalLocal => Box::new(
+            PasqalLocal::new(id).with_context(|| format!("constructing PasqalLocal for {id}"))?,
+        ),
+        QrmiResourceType::AliceBobFelis => Box::new(
+            AliceBobFelis::new(id)
+                .with_context(|| format!("constructing AliceBobFelis for {id}"))?,
+        ),
+        QrmiResourceType::IqmServer => Box::new(
+            IQMServer::new(id).with_context(|| format!("constructing IQMServer for {id}"))?,
+        ),
     };
     Ok(backend)
 }

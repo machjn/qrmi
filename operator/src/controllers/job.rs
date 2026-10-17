@@ -64,7 +64,10 @@ pub async fn reconcile(
     let resource_name = match annotations.get(ANNOTATION_RESOURCE) {
         Some(v) => v.clone(),
         None => {
-            debug!("Job {} has no quantum.qrmi.io/resource annotation; skipping", job.name_any());
+            debug!(
+                "Job {} has no quantum.qrmi.io/resource annotation; skipping",
+                job.name_any()
+            );
             return Ok(Action::await_change());
         }
     };
@@ -80,7 +83,9 @@ pub async fn reconcile(
 
     let claim_name = claim_name_for(&job.name_any());
     let custom_secret = annotations.get(ANNOTATION_SECRET_NAME).cloned();
-    let secret_name = custom_secret.clone().unwrap_or_else(|| secret_name_for(&claim_name));
+    let secret_name = custom_secret
+        .clone()
+        .unwrap_or_else(|| secret_name_for(&claim_name));
 
     let existing_claim = claims_api.get(&claim_name).await.ok();
 
@@ -92,7 +97,15 @@ pub async fn reconcile(
 
             // Step 2: create the claim owned by this job.
             let ttl: Option<u32> = annotations.get(ANNOTATION_TTL).and_then(|s| s.parse().ok());
-            create_claim(&claims_api, &claim_name, &resource_name, ttl, custom_secret, &job).await?;
+            create_claim(
+                &claims_api,
+                &claim_name,
+                &resource_name,
+                ttl,
+                custom_secret,
+                &job,
+            )
+            .await?;
             info!(claim = %claim_name, job = %job.name_any(), "QuantumResourceClaim created");
             Ok(Action::requeue(REQUEUE_WAITING))
         }
@@ -123,11 +136,7 @@ pub async fn reconcile(
                         return Ok(Action::await_change());
                     }
 
-                    let is_suspended = job
-                        .spec
-                        .as_ref()
-                        .and_then(|s| s.suspend)
-                        .unwrap_or(false);
+                    let is_suspended = job.spec.as_ref().and_then(|s| s.suspend).unwrap_or(false);
 
                     if is_suspended {
                         unsuspend_job(&jobs_api, &job.name_any()).await?;
@@ -166,8 +175,12 @@ fn claim_name_for(job_name: &str) -> String {
 
 async fn suspend_job(api: &Api<Job>, name: &str) -> Result<()> {
     let patch = serde_json::json!({"spec": {"suspend": true}});
-    api.patch(name, &PatchParams::apply("qrmi-operator"), &Patch::Merge(&patch))
-        .await?;
+    api.patch(
+        name,
+        &PatchParams::apply("qrmi-operator"),
+        &Patch::Merge(&patch),
+    )
+    .await?;
     Ok(())
 }
 
@@ -214,8 +227,12 @@ async fn create_claim(
 
 async fn unsuspend_job(api: &Api<Job>, job_name: &str) -> Result<()> {
     let patch = serde_json::json!({"spec": {"suspend": false}});
-    api.patch(job_name, &PatchParams::apply("qrmi-operator"), &Patch::Merge(&patch))
-        .await?;
+    api.patch(
+        job_name,
+        &PatchParams::apply("qrmi-operator"),
+        &Patch::Merge(&patch),
+    )
+    .await?;
     Ok(())
 }
 
