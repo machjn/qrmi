@@ -19,6 +19,6 @@ RUN pip install --no-cache-dir qrmi
 
 # Copy the example script and circuit
 COPY examples/qrmi/python/alice_bob_felis/example.py ./example.py
-COPY generated_circuit.ll ./generated_circuit.ll
+COPY operator/generated_circuit.ll ./generated_circuit.ll
 
 ENTRYPOINT ["python", "example.py", "ab_emu_1q_lescanne_2020", "generated_circuit.ll"]
