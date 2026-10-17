@@ -20,7 +20,15 @@ COPY operator/Cargo.toml operator/Cargo.toml
 
 # Install the musl target here (rather than in rust-toolchain.toml) so
 # only the container build pays the cost, not every contributor's rustup.
-RUN rustup target add x86_64-unknown-linux-musl
+# The target follows the platform being built (TARGETARCH is set by
+# docker/podman), so `--platform linux/amd64` or `linux/arm64` both work.
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) echo x86_64-unknown-linux-musl ;; \
+      arm64) echo aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac > /rust-target \
+    && rustup target add "$(cat /rust-target)"
 
 # cbindgen.toml is required by the qrmi crate's build.rs
 COPY cbindgen.toml .
@@ -29,20 +37,21 @@ COPY cbindgen.toml .
 RUN mkdir -p operator/src && echo 'fn main(){}' > operator/src/main.rs \
     && mkdir -p src && touch src/lib.rs
 
-RUN cargo build --release --target x86_64-unknown-linux-musl -p qrmi-operator --locked 2>/dev/null || true
+RUN cargo build --release --target "$(cat /rust-target)" -p qrmi-operator --locked 2>/dev/null || true
 
 # Now copy real source and rebuild (only changed crates recompile).
 COPY src/ src/
 COPY build.rs .
 COPY operator/src/ operator/src/
 
-RUN cargo build --release --target x86_64-unknown-linux-musl -p qrmi-operator --locked
+RUN cargo build --release --target "$(cat /rust-target)" -p qrmi-operator --locked \
+    && cp "target/$(cat /rust-target)/release/qrmi-operator" /build/qrmi-operator
 
 # ---------------------------------------------------------------------------
 # Runtime stage — static musl binary needs no glibc; scratch is minimal
 # ---------------------------------------------------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/qrmi-operator /qrmi-operator
+COPY --from=builder /build/qrmi-operator /qrmi-operator
 
 ENTRYPOINT ["/qrmi-operator"]
