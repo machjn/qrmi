@@ -1,6 +1,7 @@
 // This code is part of Qiskit.
 //
-// (C) Copyright IBM, Pasqal, Alice and Bob 2025, 2026
+// (C) Copyright IBM, Pasqal, Alice and Bob,  2025, 2026
+// (C) Copyright UKRI-STFC (Hartree Centre) 2026
 //
 // This code is licensed under the Apache License, Version 2.0. You may
 // obtain a copy of this license in the LICENSE.txt file in the root directory
@@ -10,14 +11,11 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 #![allow(dead_code)]
-use crate::alice_bob::AliceBobFelis;
+use crate::error::{QrmiError, QrmiErrorKind};
 use crate::ibm::IBMQiskitRuntimeServiceProvider;
+use crate::ibm::IBMQuantumComputeServiceProvider;
 use crate::ibm::IBMQuantumSystemProvider;
-use crate::ibm::{IBMQiskitRuntimeService, IBMQuantumSystem};
-use crate::iqm::IQMServer;
 use crate::models::{Config, ResourceType, TaskStatus};
-use crate::pasqal::PasqalCloud;
-use crate::pasqal::PasqalLocal;
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
@@ -25,16 +23,71 @@ use std::sync::Arc;
 
 /// Integer return codes returned to C.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub enum ReturnCode {
     /// Success.
     Success = 0,
-    /// Error.
+    /// Error. Generic/uncategorized failure -- see `qrmi_get_last_error()`
+    /// for the message and `qrmi_get_last_error_kind()` for a more specific
+    /// machine-readable reason when available.
     Error = 100,
     /// Unexpected null pointer.
     NullPointerError = 101,
+    /// A required environment variable was not set.
+    EnvVarNotSetError = 102,
+    /// A configuration value could not be parsed.
+    ParseError = 103,
+    /// Dynamic discovery was requested for an unsupported resource type.
+    UnsupportedResourceTypeError = 104,
+    /// The requested operation is not supported by this resource.
+    UnsupportedFunctionError = 105,
+    /// The payload variant is not supported by this backend.
+    UnsupportedPayloadError = 106,
+    /// The task is not in a state that allows the requested operation.
+    TaskNotReadyError = 107,
+    /// A required key was missing from a provider's environment variable map.
+    MissingConfigKeyError = 108,
+    /// A value was invalid, whether QRMI itself rejected it locally or a
+    /// vendor's API rejected the resulting request after receiving it.
+    InvalidInputError = 109,
+    /// The named resource (e.g. a backend) does not exist.
+    ResourceNotFoundError = 111,
+    /// The named task (e.g. a job) does not exist, or has already been
+    /// removed.
+    TaskNotFoundError = 112,
+    /// The request's credentials were missing or rejected.
+    AuthenticationFailedError = 113,
+    /// A configuration value (or combination of values) was invalid.
+    InvalidConfigError = 114,
 }
 
-pub type QrmiLogCallback = crate::common::QrmiLogCallback;
+impl From<QrmiErrorKind> for ReturnCode {
+    fn from(kind: QrmiErrorKind) -> Self {
+        match kind {
+            QrmiErrorKind::EnvVarNotSet => ReturnCode::EnvVarNotSetError,
+            QrmiErrorKind::ParseError => ReturnCode::ParseError,
+            QrmiErrorKind::UnsupportedResourceType => ReturnCode::UnsupportedResourceTypeError,
+            QrmiErrorKind::UnsupportedPayload => ReturnCode::UnsupportedPayloadError,
+            QrmiErrorKind::UnsupportedFunction => ReturnCode::UnsupportedFunctionError,
+            QrmiErrorKind::TaskNotReady => ReturnCode::TaskNotReadyError,
+            QrmiErrorKind::MissingConfigKey => ReturnCode::MissingConfigKeyError,
+            QrmiErrorKind::InvalidConfig => ReturnCode::InvalidConfigError,
+            QrmiErrorKind::ResourceNotFound => ReturnCode::ResourceNotFoundError,
+            QrmiErrorKind::TaskNotFound => ReturnCode::TaskNotFoundError,
+            QrmiErrorKind::AuthenticationFailed => ReturnCode::AuthenticationFailedError,
+            QrmiErrorKind::InvalidInput => ReturnCode::InvalidInputError,
+            QrmiErrorKind::Other => ReturnCode::Error,
+        }
+    }
+}
+
+/// C ABI type for `qrmi_log_callback_set`. This is a C-facing detail: it
+/// does not appear anywhere in `common.rs`, which only knows about plain
+/// Rust closures (see `common::LogSink`). `qrmi_log_callback_set` below
+/// adapts one of these into a `LogSink` at registration time.
+pub type QrmiLogCallback = Option<
+    unsafe extern "C" fn(level: *const c_char, target: *const c_char, message: *const c_char),
+>;
 
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +123,20 @@ pub enum Payload {
         use_timeslot: c_int,
         /// Optional user-defined tag associated with the job
         tag: *mut c_char,
+    },
+    /// Payload for OQTOPUS Cloud
+    Oqtopus {
+        /// Job spec, as a JSON object string matching the keyword
+        /// arguments of Python's `OqtopusJobSpec` dataclass, minus
+        /// `device_id` (QRMI fills that in automatically). Required
+        /// keys: `job_type` (one of "sampling", "estimation",
+        /// "multi_manual", "sse") and `program` (array of strings; a
+        /// single program is a single-element array; `sse` jobs require
+        /// exactly one). Optional keys: `shots` (integer; omit the key
+        /// entirely to use OQTOPUS's default of 1000 — sending `null`
+        /// fails), `name`, `description`, `transpiler_info`,
+        /// `simulator_info`, `mitigation_info`, and `operator`.
+        job_spec: *mut c_char,
     },
 }
 
@@ -109,6 +176,9 @@ pub struct ResourceDef {
 
 /// Type alias for the C ResourceDef struct (used in qrmi_provider_new).
 type CResourceDef = ResourceDef;
+
+/// Type alias for key-value map
+pub type ConfigMap = EnvironmentVariables;
 
 /// Converts a C `EnvironmentVariables` struct to a Rust `HashMap<String, String>`.
 unsafe fn envvars_to_hashmap(
@@ -153,6 +223,12 @@ unsafe fn rebuild_resource_def(def: &ResourceDef) -> anyhow::Result<crate::model
     })
 }
 
+/// Quantum resource status
+#[derive(Debug)]
+pub struct ResourceStatus {
+    inner: crate::models::ResourceStatus,
+}
+
 /// Quantum resource metadata
 #[derive(Debug)]
 pub struct ResourceMetadata {
@@ -161,13 +237,14 @@ pub struct ResourceMetadata {
 
 /// Quantum resource handle
 pub struct QuantumResource {
-    inner: Box<dyn crate::QuantumResource>,
+    inner: Box<dyn crate::QuantumResource + Send + Sync>,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
 // Last error
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+    static LAST_ERROR_KIND: RefCell<QrmiErrorKind> = const { RefCell::new(QrmiErrorKind::Other) };
 }
 
 /// Set last error message text
@@ -181,6 +258,46 @@ fn _set_last_error(msg: String) {
     });
 }
 
+/// Records `err` as the last error -- both its message (via `_set_last_error`,
+/// retrievable through `qrmi_get_last_error()`) and its machine-readable kind
+/// (retrievable through `qrmi_get_last_error_kind()`) -- and returns the
+/// `ReturnCode` matching that kind. Centralizing this means a new `QrmiError`
+/// variant automatically gets consistent handling everywhere it's used,
+/// instead of each call site choosing what to record.
+fn _fail(err: QrmiError) -> ReturnCode {
+    let kind = err.kind();
+    LAST_ERROR_KIND.with(|cell| *cell.borrow_mut() = kind);
+    _set_last_error(err.to_string());
+    ReturnCode::from(kind)
+}
+
+/// Same recording as `_fail`, for call sites that return a pointer (`NULL`
+/// on failure) rather than a `ReturnCode` and so can't use `_fail`'s return
+/// value directly.
+fn _record_error(err: QrmiError) {
+    let kind = err.kind();
+    LAST_ERROR_KIND.with(|cell| *cell.borrow_mut() = kind);
+    _set_last_error(err.to_string());
+}
+
+/// Converts a Rust string into a `CString` suitable for handing across the
+/// C ABI, stripping any embedded NUL bytes first (a `&str` may contain
+/// them; a C string cannot). Used only at the C boundary -- see
+/// `qrmi_log_callback_set`'s adapter closure -- because this is where
+/// Rust's log records get converted to the C-callable log callback's
+/// pointer arguments.
+fn sanitized_cstring(value: &str) -> CString {
+    CString::new(
+        value
+            .as_bytes()
+            .iter()
+            .copied()
+            .filter(|byte| *byte != 0)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_default()
+}
+
 /// @ingroup Qrmi
 /// Registers a QRMI log callback for C hosts.
 ///
@@ -192,7 +309,7 @@ fn _set_last_error(msg: String) {
 ///
 /// # Safety
 ///
-/// * If `callback` is non-NULL, it must remain a valid, callable function
+/// * If `callback` is non-null, it must remain a valid, callable function
 ///   pointer for as long as it might still be invoked. Because a
 ///   currently-executing log call may have already captured the previous
 ///   callback pointer, do not unload code backing a callback immediately
@@ -213,7 +330,22 @@ fn _set_last_error(msg: String) {
 /// @version 0.20.0
 #[no_mangle]
 pub unsafe extern "C" fn qrmi_log_callback_set(callback: QrmiLogCallback) -> ReturnCode {
-    let result = crate::common::set_log_callback(callback);
+    let sink: Option<crate::common::LogSink> = callback.map(|f| {
+        let adapter: crate::common::LogSink = std::sync::Arc::new(move |level, target, message| {
+            let level = sanitized_cstring(level.as_str());
+            let target = sanitized_cstring(target);
+            let message = sanitized_cstring(message);
+            // SAFETY: `f` is a C function pointer supplied by the caller of
+            // `qrmi_log_callback_set`, which documents the same validity
+            // requirement this closure now carries: `f` must remain valid
+            // and callable for as long as it might still be invoked.
+            unsafe {
+                f(level.as_ptr(), target.as_ptr(), message.as_ptr());
+            }
+        });
+        adapter
+    });
+    let result = crate::common::set_log_sink(sink);
     crate::common::initialize();
     match result {
         Ok(()) => ReturnCode::Success,
@@ -438,7 +570,7 @@ pub unsafe extern "C" fn qrmi_config_resource_def_get(
 
 /// @ingroup QrmiConfig
 /// Converts ResourceType to string representation used in qrmi_config.json, e.g.
-/// @ref QrmiResourceType::QRMI_RESOURCE_TYPE_QISKIT_RUNTIME_SERVICE to `qiskit-runtime-service`.
+/// @ref QrmiResourceType::QRMI_RESOURCE_TYPE_QUANTUM_COMPUTE_SERVICE to `ibm-quantum-compute-service`.
 ///
 /// # Safety
 ///
@@ -447,7 +579,7 @@ pub unsafe extern "C" fn qrmi_config_resource_def_get(
 /// # Example
 ///
 /// @code
-///   char *type_as_str = qrmi_config_resource_type_to_str(QRMI_RESOURCE_TYPE_QISKIT_RUNTIME_SERVICE):
+///   char *type_as_str = qrmi_config_resource_type_to_str(QRMI_RESOURCE_TYPE_QUANTUM_COMPUTE_SERVICE):
 ///   printf("%s\n", type_as_str);
 /// @endcode
 ///
@@ -523,7 +655,7 @@ pub unsafe extern "C" fn qrmi_config_resource_def_free(ptr: *mut ResourceDef) ->
 ///
 /// * The memory pointed to by `outlen` must have enough room to store size_t value.
 ///
-/// * `names` must be non nul.
+/// * `names` must be non-null.
 ///
 /// # Example
 ///
@@ -593,22 +725,44 @@ pub unsafe extern "C" fn qrmi_config_resource_names_get(
 /// # Example
 ///
 /// @code
-///   const char * last_error = qrmi_get_last_error();
+///   char * last_error = qrmi_get_last_error();
 ///   if (last_error != NULL) {
 ///     printf("last error = %s\n", last_error);
 ///     qrmi_string_free(last_error);
 ///   }
 /// @endcode
 ///
-/// @return message text of the most recent error
+/// @return message text of the most recent error. The caller takes
+/// ownership of the returned string and must release it with
+/// `qrmi_string_free()` once done with it (or it will leak). Returns NULL
+/// if no error has been recorded yet.
 /// @version 0.8.0
 #[no_mangle]
-pub unsafe extern "C" fn qrmi_get_last_error() -> *const c_char {
+pub unsafe extern "C" fn qrmi_get_last_error() -> *mut c_char {
     crate::common::initialize();
     LAST_ERROR.with(|cell| match &*cell.borrow() {
-        Some(cstr) => cstr.as_ptr(),
-        None => std::ptr::null(),
+        Some(cstr) => cstr.clone().into_raw(),
+        None => std::ptr::null_mut(),
     })
+}
+
+/// @ingroup QrmiCore
+/// Returns a machine-readable classification of the most recent error
+/// encountered during an API call, complementing `qrmi_get_last_error()`'s
+/// human-readable message. Unlike `qrmi_get_last_error()`, this value is
+/// NOT cleared after being read, since callers typically check it before
+/// (or without) reading the message.
+///
+/// If no QRMI-specific error has been recorded (e.g. the failure came from
+/// an unrelated source, or no error has occurred yet), this returns
+/// `QRMI_RETURN_CODE_ERROR` -- the generic code -- as a safe default.
+///
+/// @return A `ReturnCode` describing the kind of the most recent error.
+/// @version 0.16.0
+#[no_mangle]
+pub unsafe extern "C" fn qrmi_get_last_error_kind() -> ReturnCode {
+    crate::common::initialize();
+    LAST_ERROR_KIND.with(|cell| ReturnCode::from(*cell.borrow()))
 }
 
 /// @ingroup QrmiQuantumResource
@@ -643,50 +797,90 @@ pub unsafe extern "C" fn qrmi_resource_new(
     ffi_helpers::null_pointer_check!(resource_id, std::ptr::null_mut());
 
     if let Ok(id_str) = CStr::from_ptr(resource_id).to_str() {
-        let res: Box<dyn crate::QuantumResource> = match resource_type {
-            ResourceType::IBMQuantumSystem => match IBMQuantumSystem::new(id_str) {
-                Ok(v) => Box::new(v),
-                Err(err) => {
-                    _set_last_error(format!("{}", err));
-                    return std::ptr::null_mut();
-                }
-            },
-            ResourceType::QiskitRuntimeService => match IBMQiskitRuntimeService::new(id_str) {
-                Ok(v) => Box::new(v),
-                Err(err) => {
-                    _set_last_error(format!("{}", err));
-                    return std::ptr::null_mut();
-                }
-            },
-            ResourceType::PasqalCloud => match PasqalCloud::new(id_str) {
-                Ok(v) => Box::new(v),
-                Err(err) => {
-                    _set_last_error(format!("{}", err));
-                    return std::ptr::null_mut();
-                }
-            },
-            ResourceType::PasqalLocal => match PasqalLocal::new(id_str) {
-                Ok(v) => Box::new(v),
-                Err(err) => {
-                    _set_last_error(format!("{}", err));
-                    return std::ptr::null_mut();
-                }
-            },
-            ResourceType::AliceBobFelis => match AliceBobFelis::new(id_str) {
-                Ok(v) => Box::new(v),
-                Err(err) => {
-                    _set_last_error(format!("{}", err));
-                    return std::ptr::null_mut();
-                }
-            },
-            ResourceType::IQMServer => match IQMServer::new(id_str) {
-                Ok(v) => Box::new(v),
-                Err(err) => {
-                    _set_last_error(format!("{}", err));
-                    return std::ptr::null_mut();
-                }
-            },
+        let res = match crate::common::create_resource(&resource_type, id_str) {
+            Ok(v) => v,
+            Err(err) => {
+                _record_error(err);
+                return std::ptr::null_mut();
+            }
         };
+
+        let qrmi = Box::new(QuantumResource {
+            inner: res,
+            runtime: Arc::new(tokio::runtime::Runtime::new().unwrap()),
+        });
+        return Box::into_raw(qrmi);
+    }
+    std::ptr::null_mut()
+}
+
+/// @ingroup QrmiQuantumResource
+/// Constructs a QrmiQuantumResource from a config map.
+///
+/// Created QrmiQuantumResource instance needs to be removed by qrmi_resource_free() call if
+/// no longer needed.
+///
+/// # Safety
+///
+/// * `config` must be a valid pointer to a QrmiConfigMap struct.
+///
+/// * The memory pointed to by `resource_id` must contain a valid nul terminator.
+///
+/// * The nul terminator must be within `isize::MAX` from `resource_id`
+///
+/// # Example
+///
+/// @code
+///   QrmiConfigMap config;
+///
+///   QrmiKeyValue variables[] = {
+///       {(char *)"qrmi_warden_url", (char *)"http://localhost:8006"},
+///       {(char *)"qrmi_job_id", (char *)"1"},
+///       {(char *)"qrmi_job_uid", (char *)"1000"},
+///   };
+///   config.variables = variables;
+///   config.length = 3;
+///   QrmiQuantumResource *qrmi = qrmi_resource_new_from_config("your_resource_name",
+///                                                 QRMI_RESOURCE_TYPE_PASQAL_LOCAL,
+///                                                 &config);
+/// @endcode
+///
+/// @param (resource_id) [in] A resource identifier, i.e. backend name
+/// @param (resource_type) [in] QrmiResourceType variant
+/// @param (config) [in] Pointer to QrmiConfigMap holding the config map
+/// @return a QrmiQuantumResource handle if succeeded, otherwise NULL. Must call qrmi_resource_free() to free if no longer used.
+/// @version 0.25.0
+#[no_mangle]
+pub unsafe extern "C" fn qrmi_resource_new_from_config(
+    resource_id: *const c_char,
+    resource_type: ResourceType,
+    config: *const ConfigMap,
+) -> *mut QuantumResource {
+    crate::common::initialize();
+    ffi_helpers::null_pointer_check!(resource_id, std::ptr::null_mut());
+    if config.is_null() {
+        _set_last_error("config is NULL".to_string());
+        return std::ptr::null_mut();
+    }
+
+    let config_map = match envvars_to_hashmap(&*config) {
+        Ok(m) => m,
+        Err(e) => {
+            _set_last_error(format!("{:?}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    if let Ok(id_str) = CStr::from_ptr(resource_id).to_str() {
+        let res =
+            match crate::common::create_resource_from_config(&resource_type, id_str, config_map) {
+                Ok(v) => v,
+                Err(err) => {
+                    _record_error(err);
+                    return std::ptr::null_mut();
+                }
+            };
+
         let qrmi = Box::new(QuantumResource {
             inner: res,
             runtime: Arc::new(tokio::runtime::Runtime::new().unwrap()),
@@ -730,6 +924,9 @@ pub unsafe extern "C" fn qrmi_resource_free(ptr: *mut QuantumResource) -> Return
 /// @ingroup QrmiQuantumResource
 /// Returns true if device is accessible, otherwise false.
 ///
+/// @deprecated Use qrmi_resource_status() instead. This function will be
+/// removed in a future release.
+///
 /// # Safety
 ///
 /// * `qrmi` must have been returned by a previous call to qrmi_resource_new().
@@ -765,6 +962,10 @@ pub unsafe extern "C" fn qrmi_resource_is_accessible(
     }
     ffi_helpers::null_pointer_check!(outp, ReturnCode::Error);
 
+    // Deliberately calls the (deprecated) trait method rather than
+    // deriving the answer from status(): each vendor keeps its own
+    // definition of "accessible", so this binding's behavior is unchanged.
+    #[allow(deprecated)]
     let result = (*qrmi)
         .runtime
         .block_on(async { (*qrmi).inner.is_accessible().await });
@@ -773,11 +974,449 @@ pub unsafe extern "C" fn qrmi_resource_is_accessible(
             *outp = v;
             ReturnCode::Success
         }
-        Err(err) => {
-            _set_last_error(format!("{:?}", err));
-            ReturnCode::Error
-        }
+        Err(err) => _fail(err),
     }
+}
+
+/// @ingroup QrmiQuantumResource
+/// Returns the status of the specified resource.
+///
+/// # Safety
+///
+/// * `qrmi` must have been returned by a previous call to qrmi_resource_new().
+///
+/// * `outp` must be non-null.
+///
+/// @code
+///   QrmiResourceStatus *status = NULL;
+///   QrmiReturnCode rc = qrmi_resource_status(qrmi, &status);
+///   if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///     qrmi_resource_status_free(status);
+///   }
+/// @endcode
+///
+/// @param (qrmi) [in] A QrmiQuantumResource handle
+/// @param (outp) [out] Resource status if succeeded. Must call qrmi_resource_status_free() to free if no longer used.
+/// @return @ref QrmiReturnCode::QRMI_RETURN_CODE_SUCCESS if succeeded.
+/// @version 0.25.0
+#[no_mangle]
+pub unsafe extern "C" fn qrmi_resource_status(
+    qrmi: *mut QuantumResource,
+    outp: *mut *mut ResourceStatus,
+) -> ReturnCode {
+    crate::common::initialize();
+    if qrmi.is_null() || outp.is_null() {
+        return ReturnCode::NullPointerError;
+    }
+
+    let result = (*qrmi)
+        .runtime
+        .block_on(async { (*qrmi).inner.status().await });
+
+    match result {
+        Ok(v) => {
+            *outp = Box::into_raw(Box::new(ResourceStatus { inner: v }));
+            ReturnCode::Success
+        }
+        Err(err) => _fail(err),
+    }
+}
+
+/// @ingroup QrmiResourceStatus
+/// Frees the memory space pointed to by `ptr`, which must have been
+/// returned by a previous call to qrmi_resource_status(). Otherwise, or
+/// if `ptr` has already been freed, segmentation fault occurs. If `ptr`
+/// is NULL, returns < 0.
+///
+/// # Safety
+///
+/// * `ptr` must have been returned by a previous call to qrmi_resource_status().
+///
+/// # Example
+///
+/// @code
+///   QrmiResourceStatus *status = NULL;
+///   QrmiReturnCode rc = qrmi_resource_status(qrmi, &status);
+///   if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///     qrmi_resource_status_free(status);
+///   }
+/// @endcode
+///
+/// @param (ptr) [in] A QrmiResourceStatus handle to be free
+/// @return @ref QrmiReturnCode::QRMI_RETURN_CODE_SUCCESS if succeeded.
+/// @version 0.25.0
+#[no_mangle]
+pub unsafe extern "C" fn qrmi_resource_status_free(ptr: *mut ResourceStatus) -> ReturnCode {
+    crate::common::initialize();
+    if ptr.is_null() {
+        return ReturnCode::NullPointerError;
+    }
+    unsafe {
+        let _ = Box::from_raw(ptr);
+    };
+    ReturnCode::Success
+}
+
+/// @ingroup QrmiResourceStatus
+/// Returns the resource's status code (Online/Offline/Paused).
+///
+/// # Safety
+///
+/// * `status` must have been returned by a previous call to qrmi_resource_status().
+///
+/// * `outp` must be non-null.
+///
+/// @code
+///   QrmiResourceStatus *status = NULL;
+///   QrmiReturnCode rc = qrmi_resource_status(qrmi, &status);
+///   if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///     QrmiResourceStatusCode code;
+///     rc = qrmi_resource_status_code(status, &code);
+///     if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///       switch (code) {
+///         case QRMI_RESOURCE_STATUS_CODE_ONLINE:
+///           printf("online\n");
+///           break;
+///         case QRMI_RESOURCE_STATUS_CODE_OFFLINE:
+///           printf("offline\n");
+///           break;
+///         case QRMI_RESOURCE_STATUS_CODE_PAUSED:
+///           printf("paused\n");
+///           break;
+///         case QRMI_RESOURCE_STATUS_CODE_BUSY:
+///           printf("busy\n");
+///           break;
+///       }
+///     }
+///     qrmi_resource_status_free(status);
+///   }
+/// @endcode
+///
+/// @param (status) [in] A QrmiResourceStatus handle
+/// @param (outp) [out] The status code
+/// @return @ref QrmiReturnCode::QRMI_RETURN_CODE_SUCCESS if succeeded.
+/// @version 0.25.0
+#[no_mangle]
+pub unsafe extern "C" fn qrmi_resource_status_code(
+    status: *mut ResourceStatus,
+    outp: *mut crate::models::ResourceStatusCode,
+) -> ReturnCode {
+    crate::common::initialize();
+    if status.is_null() || outp.is_null() {
+        return ReturnCode::NullPointerError;
+    }
+    *outp = (*status).inner.status.clone();
+    ReturnCode::Success
+}
+
+/// @ingroup QrmiResourceStatus
+/// Converts a QrmiResourceStatusCode value to a human-readable, lowercase
+/// string ("online", "offline", "paused"). Intended for logging
+/// and diagnostic output.
+///
+/// # Example
+///
+/// @code
+///   QrmiResourceStatusCode code;
+///   QrmiReturnCode rc = qrmi_resource_status_code(status, &code);
+///   if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///     printf("status=%s\n", qrmi_resource_status_code_to_string(code));
+///   }
+/// @endcode
+///
+/// @param (code) [in] A QrmiResourceStatusCode value
+/// @return A statically-allocated, human-readable string. Must NOT be
+///         freed and remains valid for the lifetime of the program.
+/// @version 0.25.0
+#[no_mangle]
+pub extern "C" fn qrmi_resource_status_code_to_string(
+    code: crate::models::ResourceStatusCode,
+) -> *const c_char {
+    match code {
+        crate::models::ResourceStatusCode::Online => c"online".as_ptr(),
+        crate::models::ResourceStatusCode::Offline => c"offline".as_ptr(),
+        crate::models::ResourceStatusCode::Paused => c"paused".as_ptr(),
+    }
+}
+
+/// @ingroup QrmiResourceStatus
+/// Returns the vendor-specific status reason (e.g. "maintenance",
+/// "calibration"), if reported.
+///
+/// # Safety
+///
+/// * `status` must have been returned by a previous call to qrmi_resource_status().
+///
+/// @code
+///   QrmiResourceStatus *status = NULL;
+///   QrmiReturnCode rc = qrmi_resource_status(qrmi, &status);
+///   if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///     char *reason = qrmi_resource_status_reason(status);
+///     if (reason != NULL) {
+///       printf("reason=%s\n", reason);
+///       qrmi_string_free(reason);
+///     } else {
+///       printf("no status reason reported\n");
+///     }
+///     qrmi_resource_status_free(status);
+///   }
+/// @endcode
+///
+/// @param (status) [in] A QrmiResourceStatus handle
+/// @return status reason string if the vendor reported one. Must call
+///         qrmi_string_free() to free if no longer used. Returns NULL if
+///         `status` is NULL or the vendor did not report a reason.
+/// @version 0.25.0
+#[no_mangle]
+pub unsafe extern "C" fn qrmi_resource_status_reason(status: *mut ResourceStatus) -> *mut c_char {
+    crate::common::initialize();
+    if status.is_null() {
+        return std::ptr::null_mut();
+    }
+    match &(*status).inner.status_reason {
+        Some(reason) => match CString::new(reason.as_str()) {
+            Ok(cstr) => cstr.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// @ingroup QrmiResourceStatus
+/// Returns whether the resource is currently healthy.
+///
+/// # Safety
+///
+/// * `status` must have been returned by a previous call to qrmi_resource_status().
+///
+/// * `outp` must be non-null.
+///
+/// @code
+///   QrmiResourceStatus *status = NULL;
+///   QrmiReturnCode rc = qrmi_resource_status(qrmi, &status);
+///   if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///     bool healthy = false;
+///     rc = qrmi_resource_status_healthy(status, &healthy);
+///     if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///       printf("healthy=%d\n", healthy);
+///     } else if (rc == QRMI_RETURN_CODE_UNSUPPORTED_FUNCTION_ERROR) {
+///       printf("this vendor does not report health information\n");
+///     } else {
+///       printf("qrmi_resource_status_healthy() failed: %s\n", qrmi_get_last_error());
+///     }
+///     qrmi_resource_status_free(status);
+///   }
+/// @endcode
+///
+/// @param (status) [in] A QrmiResourceStatus handle
+/// @param (outp) [out] Whether the resource is healthy
+/// @return @ref QrmiReturnCode::QRMI_RETURN_CODE_SUCCESS if succeeded.
+///         @ref QrmiReturnCode::QRMI_RETURN_CODE_UNSUPPORTED_FUNCTION_ERROR
+///         if the vendor does not report health information.
+/// @version 0.25.0
+#[no_mangle]
+pub unsafe extern "C" fn qrmi_resource_status_healthy(
+    status: *mut ResourceStatus,
+    outp: *mut bool,
+) -> ReturnCode {
+    crate::common::initialize();
+    if status.is_null() || outp.is_null() {
+        return ReturnCode::NullPointerError;
+    }
+    match (*status).inner.healthy {
+        Some(v) => {
+            *outp = v;
+            ReturnCode::Success
+        }
+        None => _fail(QrmiError::UnsupportedFunction(
+            "this vendor does not report health information".to_string(),
+        )),
+    }
+}
+
+/// @ingroup QrmiResourceStatus
+/// Returns whether the resource is currently busy.
+///
+/// # Safety
+///
+/// * `status` must have been returned by a previous call to qrmi_resource_status().
+///
+/// * `outp` must be non-null.
+///
+/// @code
+///   QrmiResourceStatus *status = NULL;
+///   QrmiReturnCode rc = qrmi_resource_status(qrmi, &status);
+///   if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///     bool busy = false;
+///     rc = qrmi_resource_status_busy(status, &busy);
+///     if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///       printf("busy=%d\n", busy);
+///     } else if (rc == QRMI_RETURN_CODE_UNSUPPORTED_FUNCTION_ERROR) {
+///       printf("this vendor does not report busy information\n");
+///     } else {
+///       printf("qrmi_resource_status_busy() failed: %s\n", qrmi_get_last_error());
+///     }
+///     qrmi_resource_status_free(status);
+///   }
+/// @endcode
+///
+/// @param (status) [in] A QrmiResourceStatus handle
+/// @param (outp) [out] Whether the resource is busy
+/// @return @ref QrmiReturnCode::QRMI_RETURN_CODE_SUCCESS if succeeded.
+///         @ref QrmiReturnCode::QRMI_RETURN_CODE_UNSUPPORTED_FUNCTION_ERROR
+///         if the vendor does not report health information.
+/// @version 0.25.0
+#[no_mangle]
+pub unsafe extern "C" fn qrmi_resource_status_busy(
+    status: *mut ResourceStatus,
+    outp: *mut bool,
+) -> ReturnCode {
+    crate::common::initialize();
+    if status.is_null() || outp.is_null() {
+        return ReturnCode::NullPointerError;
+    }
+    match (*status).inner.busy {
+        Some(v) => {
+            *outp = v;
+            ReturnCode::Success
+        }
+        None => _fail(QrmiError::UnsupportedFunction(
+            "this vendor does not report busy information".to_string(),
+        )),
+    }
+}
+
+/// @ingroup QrmiResourceStatus
+/// Returns the number of jobs pending in the queue.
+///
+/// # Safety
+///
+/// * `status` must have been returned by a previous call to qrmi_resource_status().
+///
+/// * `outp` must be non-null.
+///
+/// @code
+///   QrmiResourceStatus *status = NULL;
+///   QrmiReturnCode rc = qrmi_resource_status(qrmi, &status);
+///   if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///     uint64_t pending_job_count = 0;
+///     rc = qrmi_resource_status_pending_job_count(status, &pending_job_count);
+///     if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///       printf("pending_job_count=%llu\n", (unsigned long long)pending_job_count);
+///     } else if (rc == QRMI_RETURN_CODE_UNSUPPORTED_FUNCTION_ERROR) {
+///       printf("this resource has no queue / does not report pending job count\n");
+///     } else {
+///       printf("qrmi_resource_status_pending_job_count() failed: %s\n", qrmi_get_last_error());
+///     }
+///     qrmi_resource_status_free(status);
+///   }
+/// @endcode
+///
+/// @param (status) [in] A QrmiResourceStatus handle
+/// @param (outp) [out] Number of pending jobs
+/// @return @ref QrmiReturnCode::QRMI_RETURN_CODE_SUCCESS if succeeded.
+///         @ref QrmiReturnCode::QRMI_RETURN_CODE_UNSUPPORTED_FUNCTION_ERROR
+///         if the resource has no queue / the vendor does not report this.
+/// @version 0.25.0
+#[no_mangle]
+pub unsafe extern "C" fn qrmi_resource_status_pending_job_count(
+    status: *mut ResourceStatus,
+    outp: *mut u64,
+) -> ReturnCode {
+    crate::common::initialize();
+    if status.is_null() || outp.is_null() {
+        return ReturnCode::NullPointerError;
+    }
+    match (*status).inner.pending_job_count {
+        Some(v) => {
+            *outp = v;
+            ReturnCode::Success
+        }
+        None => _fail(QrmiError::UnsupportedFunction(
+            "this resource has no queue / does not report pending job count".to_string(),
+        )),
+    }
+}
+
+/// @ingroup QrmiResourceStatus
+/// Returns the resource's capacity information, if reported.
+///
+/// # Safety
+///
+/// * `status` must have been returned by a previous call to qrmi_resource_status().
+///
+/// * `outp` must be non-null.
+///
+/// @code
+///   QrmiResourceCapacity *capacity = NULL;
+///   QrmiReturnCode rc = qrmi_resource_status_capacity(status, &capacity);
+///   if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///     printf("available_slots=%u\n", capacity->available_slots);
+///     qrmi_resource_capacity_free(capacity);
+///   }
+/// @endcode
+///
+/// @param (status) [in] A QrmiResourceStatus handle
+/// @param (outp) [out] Capacity handle if succeeded. Must call
+///        qrmi_resource_capacity_free() to free if no longer used.
+/// @return @ref QrmiReturnCode::QRMI_RETURN_CODE_SUCCESS if succeeded.
+///         @ref QrmiReturnCode::QRMI_RETURN_CODE_UNSUPPORTED_FUNCTION_ERROR
+///         if the vendor does not report capacity information.
+/// @version 0.25.0
+#[no_mangle]
+pub unsafe extern "C" fn qrmi_resource_status_capacity(
+    status: *mut ResourceStatus,
+    outp: *mut *mut crate::models::ResourceCapacity,
+) -> ReturnCode {
+    crate::common::initialize();
+    if status.is_null() || outp.is_null() {
+        return ReturnCode::NullPointerError;
+    }
+    match (*status).inner.capacity.clone() {
+        Some(cap) => {
+            *outp = Box::into_raw(Box::new(cap));
+            ReturnCode::Success
+        }
+        None => _fail(QrmiError::UnsupportedFunction(
+            "this vendor does not report capacity information".to_string(),
+        )),
+    }
+}
+
+/// @ingroup QrmiResourceStatus
+/// Frees a QrmiResourceCapacity handle returned by
+/// qrmi_resource_status_capacity().
+///
+/// # Safety
+///
+/// * `ptr` must have been returned by a previous call to
+///   qrmi_resource_status_capacity(). Otherwise, or if `ptr` has already
+///   been freed, undefined behavior occurs.
+///
+/// @code
+///   QrmiResourceCapacity *capacity = NULL;
+///   QrmiReturnCode rc = qrmi_resource_status_capacity(status, &capacity);
+///   if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///     printf("available_slots=%u\n", capacity->available_slots);
+///     qrmi_resource_capacity_free(capacity);
+///   }
+/// @endcode
+///
+/// @param (ptr) [in] A QrmiResourceCapacity handle to be freed
+/// @return @ref QrmiReturnCode::QRMI_RETURN_CODE_SUCCESS if succeeded.
+/// @version 0.25.0
+#[no_mangle]
+pub unsafe extern "C" fn qrmi_resource_capacity_free(
+    ptr: *mut crate::models::ResourceCapacity,
+) -> ReturnCode {
+    crate::common::initialize();
+    if ptr.is_null() {
+        return ReturnCode::NullPointerError;
+    }
+    unsafe {
+        let _ = Box::from_raw(ptr);
+    };
+    ReturnCode::Success
 }
 
 /// @ingroup QrmiQuantumResource
@@ -787,7 +1426,7 @@ pub unsafe extern "C" fn qrmi_resource_is_accessible(
 ///
 /// * `qrmi` must have been returned by a previous call to qrmi_resource_new().
 ///
-/// * `outp` must be non nul.
+/// * `outp` must be non-null.
 #[no_mangle]
 pub unsafe extern "C" fn qrmi_resource_id(
     qrmi: *mut QuantumResource,
@@ -810,10 +1449,7 @@ pub unsafe extern "C" fn qrmi_resource_id(
                 ReturnCode::Error
             }
         }
-        Err(err) => {
-            _set_last_error(format!("{:?}", err));
-            ReturnCode::Error
-        }
+        Err(err) => _fail(err),
     }
 }
 
@@ -824,7 +1460,7 @@ pub unsafe extern "C" fn qrmi_resource_id(
 ///
 /// * `qrmi` must have been returned by a previous call to qrmi_resource_new().
 ///
-/// * `outp` must be non nul.
+/// * `outp` must be non-null.
 #[no_mangle]
 pub unsafe extern "C" fn qrmi_resource_type(
     qrmi: *mut QuantumResource,
@@ -844,10 +1480,7 @@ pub unsafe extern "C" fn qrmi_resource_type(
             *outp = v;
             ReturnCode::Success
         }
-        Err(err) => {
-            _set_last_error(format!("{:?}", err));
-            ReturnCode::Error
-        }
+        Err(err) => _fail(err),
     }
 }
 
@@ -858,7 +1491,7 @@ pub unsafe extern "C" fn qrmi_resource_type(
 ///
 /// * `qrmi` must have been returned by a previous call to qrmi_resource_new().
 ///
-/// * `outp` must be non nul.
+/// * `outp` must be non-null.
 ///
 /// # Example
 ///
@@ -900,7 +1533,7 @@ pub unsafe extern "C" fn qrmi_resource_acquire(
             }
         }
         Err(err) => {
-            _set_last_error(format!("{:?}", err));
+            return _fail(err);
         }
     }
     ReturnCode::Error
@@ -954,7 +1587,7 @@ pub unsafe extern "C" fn qrmi_resource_release(
                 return ReturnCode::Success;
             }
             Err(err) => {
-                _set_last_error(format!("{:?}", err));
+                return _fail(err);
             }
         }
     }
@@ -973,6 +1606,9 @@ pub unsafe extern "C" fn qrmi_resource_release(
 /// * The memory pointed to by `input` and `program_id` in QrmiPayload_QiskitPrimitive_Body contain a valid nul terminator.
 ///
 /// * The memory pointed to by `sequence` in QrmiPayload_PasqalCloud_Body must contain a valid nul terminator.
+///
+/// * The memory pointed to by `job_spec` in QrmiPayload_Oqtopus_Body
+///   must contain a valid nul terminator.
 ///
 /// # Example
 ///
@@ -1072,6 +1708,14 @@ pub unsafe extern "C" fn qrmi_resource_task_start(
             tag: tag_opt,
             use_timeslot: use_timeslot_opt,
         });
+    } else if let Payload::Oqtopus { job_spec } = *payload {
+        let Ok(job_spec_str) = CStr::from_ptr(job_spec).to_str() else {
+            return ReturnCode::Error;
+        };
+
+        qrmi_payload = Some(crate::models::Payload::Oqtopus {
+            job_spec: job_spec_str.to_string(),
+        });
     }
 
     if qrmi_payload.is_some() {
@@ -1088,7 +1732,7 @@ pub unsafe extern "C" fn qrmi_resource_task_start(
                 }
             }
             Err(err) => {
-                log::error!("{:?}", err);
+                return _fail(err);
             }
         }
     }
@@ -1141,7 +1785,7 @@ pub unsafe extern "C" fn qrmi_resource_task_stop(
                 return ReturnCode::Success;
             }
             Err(err) => {
-                log::error!("{:?}", err);
+                return _fail(err);
             }
         }
     }
@@ -1203,7 +1847,7 @@ pub unsafe extern "C" fn qrmi_resource_task_status(
                 return ReturnCode::Success;
             }
             Err(err) => {
-                log::error!("{:?}", err);
+                return _fail(err);
             }
         }
     }
@@ -1217,7 +1861,7 @@ pub unsafe extern "C" fn qrmi_resource_task_status(
 ///
 /// * `qrmi` must have been returned by a previous call to qrmi_resource_new().
 ///
-/// * `outp` must be non nul.
+/// * `outp` must be non-null.
 ///
 /// * The memory pointed to by `task_id` must contain a valid nul terminator.
 ///
@@ -1268,7 +1912,7 @@ pub unsafe extern "C" fn qrmi_resource_task_result(
                 }
             }
             Err(err) => {
-                log::error!("{:?}", err);
+                return _fail(err);
             }
         }
     }
@@ -1282,7 +1926,7 @@ pub unsafe extern "C" fn qrmi_resource_task_result(
 ///
 /// * `qrmi` must have been returned by a previous call to qrmi_resource_new().
 ///
-/// * `outp` must be non nul.
+/// * `outp` must be non-null.
 ///
 /// * The memory pointed to by `task_id` must contain a valid nul terminator.
 ///
@@ -1333,7 +1977,7 @@ pub unsafe extern "C" fn qrmi_resource_task_logs(
                 }
             }
             Err(err) => {
-                log::error!("{:?}", err);
+                return _fail(err);
             }
         }
     }
@@ -1347,7 +1991,7 @@ pub unsafe extern "C" fn qrmi_resource_task_logs(
 ///
 /// * `qrmi` must have been returned by a previous call to qrmi_resource_new().
 ///
-/// * `outp` must be non nul.
+/// * `outp` must be non-null.
 ///
 /// # Example
 ///
@@ -1388,7 +2032,7 @@ pub unsafe extern "C" fn qrmi_resource_target(
             }
         }
         Err(err) => {
-            log::error!("{:?}", err);
+            return _fail(err);
         }
     }
     ReturnCode::Error
@@ -1401,7 +2045,7 @@ pub unsafe extern "C" fn qrmi_resource_target(
 ///
 /// * `qrmi` must have been returned by a previous call to qrmi_resource_new().
 ///
-/// * `outp` must be non nul.
+/// * `outp` must be non-null.
 ///
 /// # Example
 ///
@@ -1517,7 +2161,7 @@ pub unsafe extern "C" fn qrmi_resource_metadata_value(
 ///
 /// * `metadata` must have been returned by a previous call to qrmi_resource_metadata().
 ///
-/// * `num_keys` and `key_names` must be non nul.
+/// * `num_keys` and `key_names` must be non-null.
 ///
 /// # Example
 ///
@@ -1584,7 +2228,8 @@ pub struct ResourceProvider {
 /// Created handle must be released with qrmi_provider_free() when no longer needed.
 ///
 /// Currently supported resource types:
-/// - @ref QrmiResourceType::QRMI_RESOURCE_TYPE_QISKIT_RUNTIME_SERVICE
+/// - @ref QrmiResourceType::QRMI_RESOURCE_TYPE_QISKIT_RUNTIME_SERVICE(deprecated)
+/// - @ref QrmiResourceType::QRMI_RESOURCE_TYPE_IBM_QUANTUM_COMPUTE_SERVICE
 /// - @ref QrmiResourceType::QRMI_RESOURCE_TYPE_IBM_QUANTUM_SYSTEM
 ///
 /// # Safety
@@ -1598,9 +2243,9 @@ pub struct ResourceProvider {
 ///   QrmiResourceDef *def = qrmi_config_resource_def_get(config, "ibm_inst1");
 ///   QrmiResourceProvider *provider = qrmi_provider_new(def->type, &def->environments);
 ///   if (provider == NULL) {
-///     const char *err = qrmi_get_last_error();
+///     char *err = qrmi_get_last_error();
 ///     printf("error: %s\n", err);
-///     qrmi_string_free((char *)err);
+///     qrmi_string_free(err);
 ///   }
 /// @endcode
 ///
@@ -1634,7 +2279,16 @@ pub unsafe extern "C" fn qrmi_provider_new(
             match IBMQiskitRuntimeServiceProvider::new(&env_map) {
                 Ok(inner) => Box::new(inner),
                 Err(err) => {
-                    _set_last_error(format!("{:?}", err));
+                    _record_error(err);
+                    return std::ptr::null_mut();
+                }
+            }
+        }
+        ResourceType::IBMQuantumComputeService => {
+            match IBMQuantumComputeServiceProvider::new(&env_map) {
+                Ok(inner) => Box::new(inner),
+                Err(err) => {
+                    _record_error(err);
                     return std::ptr::null_mut();
                 }
             }
@@ -1642,12 +2296,14 @@ pub unsafe extern "C" fn qrmi_provider_new(
         ResourceType::IBMQuantumSystem => match IBMQuantumSystemProvider::new(&env_map) {
             Ok(inner) => Box::new(inner),
             Err(err) => {
-                _set_last_error(format!("{:?}", err));
+                _record_error(err);
                 return std::ptr::null_mut();
             }
         },
         _ => {
-            _set_last_error("Unsupported resource type for dynamic resource discovery".to_string());
+            _record_error(QrmiError::UnsupportedResourceType(format!(
+                "{resource_type:?}"
+            )));
             return std::ptr::null_mut();
         }
     };
@@ -1798,10 +2454,7 @@ pub unsafe extern "C" fn qrmi_provider_resources(
             (*resources_out).length = count;
             ReturnCode::Success
         }
-        Err(err) => {
-            _set_last_error(format!("{:?}", err));
-            ReturnCode::Error
-        }
+        Err(err) => _fail(err),
     }
 }
 
@@ -1923,9 +2576,140 @@ pub unsafe extern "C" fn qrmi_provider_least_busy(
             *resource_out = std::ptr::null_mut();
             ReturnCode::Success
         }
-        Err(err) => {
-            _set_last_error(format!("{:?}", err));
-            ReturnCode::Error
-        }
+        Err(err) => _fail(err),
     }
+}
+
+// ---------------------------------------------------------------------------
+// QRMIService C bindings
+// ---------------------------------------------------------------------------
+
+/// @ingroup QrmiService
+/// Discovers the QPU resources assigned to the current job -- read from the
+/// `QRMI_JOB_QPU_RESOURCES` / `QRMI_JOB_QPU_TYPES` environment variables, or
+/// their legacy `SLURM_JOB_QPU_RESOURCES` / `SLURM_JOB_QPU_TYPES`
+/// equivalents -- and returns the ones that are currently accessible.
+///
+/// This is the C counterpart of `qrmi.QRMIService` (Python) and
+/// `qrmi::QRMIService` (Rust); all three share the same underlying
+/// discovery/filtering logic.
+///
+/// Unlike qrmi_provider_resources(), which is called against a persistent
+/// QrmiResourceProvider handle (and can be called repeatedly, e.g. with
+/// different filters), this function takes no arguments and is a one-shot
+/// operation: there is no separate "service" handle to create or free.
+/// Discovery happens inline, and each QrmiQuantumResource handle placed in
+/// `resources_out` is independently owned by the caller from that point on
+/// -- usable with the same qrmi_resource_*() functions as a handle returned
+/// by qrmi_resource_new(), just not individually freed (see
+/// qrmi_service_resources_free() below).
+///
+/// The caller is responsible for freeing the returned struct with
+/// qrmi_service_resources_free(). Individual handles inside the struct must
+/// NOT be freed separately.
+///
+/// # Safety
+///
+/// * `resources_out` must be non-null and point to a zero-initialized
+///   QrmiQuantumResources.
+///
+/// # Example
+///
+/// @code
+///   QrmiQuantumResources resources = {0};
+///   QrmiReturnCode rc = qrmi_service_resources(&resources);
+///   if (rc == QRMI_RETURN_CODE_SUCCESS) {
+///     for (size_t i = 0; i < resources.length; i++) {
+///       char *id = NULL;
+///       qrmi_resource_id(resources.resources[i], &id);
+///       printf("resource: %s\n", id);
+///       qrmi_string_free(id);
+///     }
+///     qrmi_service_resources_free(&resources);
+///   } else {
+///     const char *err = qrmi_get_last_error();
+///     printf("error: %s\n", err);
+///   }
+/// @endcode
+///
+/// @param (resources_out) [out] Pointer to a QrmiQuantumResources struct to populate
+/// @return @ref QrmiReturnCode::QRMI_RETURN_CODE_SUCCESS if succeeded.
+/// @version 0.23.0
+#[no_mangle]
+pub unsafe extern "C" fn qrmi_service_resources(
+    resources_out: *mut QuantumResources,
+) -> ReturnCode {
+    crate::common::initialize();
+    if resources_out.is_null() {
+        return ReturnCode::NullPointerError;
+    }
+
+    // One `Runtime`, shared (via `Arc`) across every `QuantumResource`
+    // handle this call produces -- same approach `qrmi_provider_resources`
+    // takes for the handles it produces, rather than each handle getting
+    // its own `Runtime` (contrast `PyQuantumResource` in `pyext.rs`, where
+    // each Python-visible object needs to be independently droppable and
+    // so does own its own).
+    let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+    let result = runtime.block_on(async { crate::QRMIService::new().await });
+
+    match result {
+        Ok(service) => {
+            let resource_map = service.into_resource_map();
+            let count = resource_map.len();
+            let mut raw_ptrs: Vec<*mut QuantumResource> = resource_map
+                .into_values()
+                .map(|r| {
+                    Box::into_raw(Box::new(QuantumResource {
+                        inner: r,
+                        runtime: runtime.clone(),
+                    }))
+                })
+                .collect();
+
+            let ptr = raw_ptrs.as_mut_ptr();
+            std::mem::forget(raw_ptrs);
+
+            (*resources_out).resources = ptr;
+            (*resources_out).length = count;
+            ReturnCode::Success
+        }
+        Err(err) => _fail(err),
+    }
+}
+
+/// @ingroup QrmiService
+/// Frees a QrmiQuantumResources struct populated by qrmi_service_resources().
+///
+/// This frees both the individual QrmiQuantumResource handles and the
+/// internal array. After calling this, the struct's fields are zeroed.
+/// Do NOT call qrmi_resource_free() on individual elements after calling
+/// this.
+///
+/// # Safety
+///
+/// * `resources` must have been populated by a previous call to
+///   qrmi_service_resources().
+///
+/// # Example
+///
+/// @code
+///   qrmi_service_resources_free(&resources);
+/// @endcode
+///
+/// @param (resources) [in] Pointer to a QrmiQuantumResources struct to free
+/// @return @ref QrmiReturnCode::QRMI_RETURN_CODE_SUCCESS if succeeded.
+/// @version 0.23.0
+#[no_mangle]
+pub unsafe extern "C" fn qrmi_service_resources_free(
+    resources: *mut QuantumResources,
+) -> ReturnCode {
+    // Identical shape and freeing logic to `qrmi_provider_resources_free`
+    // (same `QuantumResources` struct, same ownership rules) -- delegate to
+    // it rather than duplicating the unsafe pointer-walking code. A
+    // separate function (rather than just telling callers to reuse
+    // `qrmi_provider_resources_free`) exists so the name at the call site
+    // matches the `qrmi_service_*` family it was populated by, and so it
+    // shows up under this file's `QrmiService` Doxygen group.
+    unsafe { qrmi_provider_resources_free(resources) }
 }

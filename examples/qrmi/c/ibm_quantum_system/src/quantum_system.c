@@ -16,9 +16,7 @@
 #include <unistd.h>
 
 #include "qrmi.h"
-
-extern void load_dotenv();
-extern const char *read_file(const char *);
+#include "common.h"
 
 int main(int argc, char *argv[]) {
 
@@ -34,8 +32,9 @@ int main(int argc, char *argv[]) {
   QrmiQuantumResource *qrmi =
       qrmi_resource_new(argv[1], QRMI_RESOURCE_TYPE_IBM_QUANTUM_SYSTEM);
   if (!qrmi) {
-    const char* last_error = qrmi_get_last_error();
-    fprintf(stderr, "Failed to create QRMI for %s. %s\n", argv[1], last_error);
+    const char *last_error = qrmi_get_last_error();
+    fprintf(stderr, "Failed to create QRMI for %s. %s (%d)\n", argv[1],
+            last_error, qrmi_get_last_error_kind());
     qrmi_string_free((char *)last_error);
     return EXIT_FAILURE;
   }
@@ -47,8 +46,10 @@ int main(int argc, char *argv[]) {
     QrmiResourceType resource_type;
     rc = qrmi_resource_type(qrmi, &resource_type);
     if (rc == QRMI_RETURN_CODE_SUCCESS) {
-      const char *resource_type_str = qrmi_config_resource_type_to_str(resource_type);
-      fprintf(stdout, "Selected resource: id=%s type=%s\n", resource_id, resource_type_str);
+      const char *resource_type_str =
+          qrmi_config_resource_type_to_str(resource_type);
+      fprintf(stdout, "Selected resource: id=%s type=%s\n", resource_id,
+              resource_type_str);
     }
     qrmi_string_free(resource_id);
   }
@@ -70,16 +71,28 @@ int main(int argc, char *argv[]) {
     qrmi_resource_metadata_free(metadata);
   }
 
-  bool is_accessible = false;
-  rc = qrmi_resource_is_accessible(qrmi, &is_accessible);
+  QrmiResourceStatus *res_status = NULL;
+  rc = qrmi_resource_status(qrmi, &res_status);
   if (rc == QRMI_RETURN_CODE_SUCCESS) {
-    if (is_accessible == false) {
-      fprintf(stderr, "%s cannot be accessed.\n", argv[1]);
+    QrmiResourceStatusCode status;
+    rc = qrmi_resource_status_code(res_status, &status);
+    qrmi_resource_status_free(res_status);
+    if (rc == QRMI_RETURN_CODE_SUCCESS) {
+      if (status != QRMI_RESOURCE_STATUS_CODE_ONLINE) {
+        fprintf(stderr, "%s cannot be accessed.\n", argv[1]);
+        goto error;
+      }
+    } else {
+      const char *last_error = qrmi_get_last_error();
+      fprintf(stderr, "qrmi_resource_status_code() failed. %s (%d)\n",
+              last_error, qrmi_get_last_error_kind());
+      qrmi_string_free((char *)last_error);
       goto error;
     }
   } else {
-    const char* last_error = qrmi_get_last_error();
-    fprintf(stderr, "qrmi_resource_is_accessible() failed. %s\n", last_error);
+    const char *last_error = qrmi_get_last_error();
+    fprintf(stderr, "qrmi_resource_is_accessible() failed. %s (%d)\n",
+            last_error, qrmi_get_last_error_kind());
     qrmi_string_free((char *)last_error);
     goto error;
   }
@@ -116,7 +129,10 @@ int main(int argc, char *argv[]) {
   char *job_id = NULL;
   rc = qrmi_resource_task_start(qrmi, &payload, &job_id);
   if (rc != QRMI_RETURN_CODE_SUCCESS) {
-    fprintf(stderr, "failed to start a task.\n");
+    const char *last_error = qrmi_get_last_error();
+    fprintf(stderr, "failed to start a task. %s (%d)\n", last_error,
+            qrmi_get_last_error_kind());
+    qrmi_string_free((char *)last_error);
     free((void *)input);
     goto error;
   }
@@ -150,7 +166,10 @@ int main(int argc, char *argv[]) {
     fprintf(stdout, "%s\n", logs);
     qrmi_string_free(logs);
   } else {
-    fprintf(stderr, "Failed to retrieve job logs.\n");
+    const char *last_error = qrmi_get_last_error();
+    fprintf(stderr, "Failed to retrieve job logs. %s (%d)\n", last_error,
+            qrmi_get_last_error_kind());
+    qrmi_string_free((char *)last_error);
   }
 
   qrmi_resource_task_stop(qrmi, job_id);

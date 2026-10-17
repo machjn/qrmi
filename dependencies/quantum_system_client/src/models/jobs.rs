@@ -19,6 +19,7 @@ use std::str::FromStr;
 pub enum ProgramId {
     Estimator,
     Sampler,
+    Executor,
 }
 
 impl FromStr for ProgramId {
@@ -29,6 +30,7 @@ impl FromStr for ProgramId {
         match s {
             "estimator" => Ok(ProgramId::Estimator),
             "sampler" => Ok(ProgramId::Sampler),
+            "executor" => Ok(ProgramId::Executor),
             _ => Err(ProgramIdParseError),
         }
     }
@@ -46,9 +48,10 @@ impl<'de> Deserialize<'de> for ProgramId {
         match s.as_str() {
             "estimator" => Ok(ProgramId::Estimator),
             "sampler" => Ok(ProgramId::Sampler),
+            "executor" => Ok(ProgramId::Executor),
             _ => Err(serde::de::Error::unknown_variant(
                 &s,
-                &["estimator", "sampler"],
+                &["estimator", "sampler", "executor"],
             )),
         }
     }
@@ -59,6 +62,7 @@ impl fmt::Display for ProgramId {
         let s = match *self {
             ProgramId::Estimator => "estimator",
             ProgramId::Sampler => "sampler",
+            ProgramId::Executor => "executor",
         };
         write!(f, "{}", s)
     }
@@ -186,7 +190,32 @@ impl<'de> Deserialize<'de> for StorageType {
 pub struct Usage {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
+    /// Execution time on quantum device in nanoseconds.
     pub quantum_nanoseconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
+#[allow(dead_code)]
+/// Job lifecycle timestamps.
+pub struct Timestamps {
+    /// Time when the job was created.
+    pub created: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    /// Time when the job reached a terminal status.
+    pub finished: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
+#[allow(dead_code)]
+/// Job execution metrics
+pub struct Metrics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    /// Total circuits execution time on QPU in nanoseconds.
+    pub circuits_execution_time_ns: Option<i64>,
+    /// Job lifecycle timestamps.
+    pub timestamps: Timestamps,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
@@ -227,6 +256,9 @@ pub struct Job {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub log_level: Option<LogLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub metrics: Option<Metrics>,
     pub program_id: ProgramId,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]

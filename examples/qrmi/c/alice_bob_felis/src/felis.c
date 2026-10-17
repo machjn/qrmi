@@ -15,10 +15,8 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include "common.h"
 #include "qrmi.h"
-
-extern void load_dotenv();
-extern const char *read_file(const char *);
 
 int main(int argc, char *argv[]) {
 
@@ -32,8 +30,9 @@ int main(int argc, char *argv[]) {
   QrmiQuantumResource *qrmi =
       qrmi_resource_new(argv[1], QRMI_RESOURCE_TYPE_ALICE_BOB_FELIS);
   if (!qrmi) {
-    const char* last_error = qrmi_get_last_error();
-    fprintf(stderr, "Failed to create QRMI for %s. %s\n", argv[1], last_error);
+    const char *last_error = qrmi_get_last_error();
+    fprintf(stderr, "Failed to create QRMI for %s. %s (%d)\n", argv[1],
+            last_error, qrmi_get_last_error_kind());
     qrmi_string_free((char *)last_error);
     return EXIT_FAILURE;
   }
@@ -45,22 +44,36 @@ int main(int argc, char *argv[]) {
     QrmiResourceType resource_type;
     rc = qrmi_resource_type(qrmi, &resource_type);
     if (rc == QRMI_RETURN_CODE_SUCCESS) {
-      const char *resource_type_str = qrmi_config_resource_type_to_str(resource_type);
-      fprintf(stdout, "Selected resource: id=%s type=%s\n", resource_id, resource_type_str);
+      const char *resource_type_str =
+          qrmi_config_resource_type_to_str(resource_type);
+      fprintf(stdout, "Selected resource: id=%s type=%s\n", resource_id,
+              resource_type_str);
     }
     qrmi_string_free(resource_id);
   }
 
-  bool is_accessible = false;
-  rc = qrmi_resource_is_accessible(qrmi, &is_accessible);
+  QrmiResourceStatus *res_status = NULL;
+  rc = qrmi_resource_status(qrmi, &res_status);
   if (rc == QRMI_RETURN_CODE_SUCCESS) {
-    if (is_accessible == false) {
-      fprintf(stderr, "%s cannot be accessed.\n", argv[1]);
+    QrmiResourceStatusCode status;
+    rc = qrmi_resource_status_code(res_status, &status);
+    qrmi_resource_status_free(res_status);
+    if (rc == QRMI_RETURN_CODE_SUCCESS) {
+      if (status != QRMI_RESOURCE_STATUS_CODE_ONLINE) {
+        fprintf(stderr, "%s cannot be accessed.\n", argv[1]);
+        goto error;
+      }
+    } else {
+      const char *last_error = qrmi_get_last_error();
+      fprintf(stderr, "qrmi_resource_status_code() failed. %s (%d)\n",
+              last_error, qrmi_get_last_error_kind());
+      qrmi_string_free((char *)last_error);
       goto error;
     }
   } else {
-    const char* last_error = qrmi_get_last_error();
-    fprintf(stderr, "qrmi_resource_is_accessible() failed. %s\n", last_error);
+    const char *last_error = qrmi_get_last_error();
+    fprintf(stderr, "qrmi_resource_status() failed. %s (%d)\n",
+            last_error, qrmi_get_last_error_kind());
     qrmi_string_free((char *)last_error);
     goto error;
   }
@@ -68,8 +81,9 @@ int main(int argc, char *argv[]) {
   char *acquisition_token = NULL;
   rc = qrmi_resource_acquire(qrmi, &acquisition_token);
   if (rc != QRMI_RETURN_CODE_SUCCESS) {
-    const char* last_error = qrmi_get_last_error();
-    fprintf(stdout, "qrmi_resource_acquire() failed. %s\n", last_error);
+    const char *last_error = qrmi_get_last_error();
+    fprintf(stdout, "qrmi_resource_acquire() failed. %s (%d)\n", last_error,
+            qrmi_get_last_error_kind());
     qrmi_string_free((char *)last_error);
     goto error;
   }
@@ -81,7 +95,10 @@ int main(int argc, char *argv[]) {
     fprintf(stdout, "target = %s\n", target);
     qrmi_string_free((char *)target);
   } else {
-    fprintf(stderr, "qrmi_resource_target() failed.\n");
+    const char *last_error = qrmi_get_last_error();
+    fprintf(stderr, "qrmi_resource_target() failed. %s (%d)\n", last_error,
+            qrmi_get_last_error_kind());
+    qrmi_string_free((char *)last_error);
     goto error;
   }
 
@@ -96,9 +113,8 @@ int main(int argc, char *argv[]) {
   char input_json[128];
 
   snprintf(input_json, sizeof(input_json),
-          "{\"nbShots\": %d, \"averageNbPhotons\": %d}",
-          nbShots,
-          averageNbPhotons);
+           "{\"nbShots\": %d, \"averageNbPhotons\": %d}", nbShots,
+           averageNbPhotons);
 
   QrmiPayload payload;
   payload.tag = QRMI_PAYLOAD_ALICE_BOB_FELIS;
@@ -108,7 +124,10 @@ int main(int argc, char *argv[]) {
   char *job_id = NULL;
   rc = qrmi_resource_task_start(qrmi, &payload, &job_id);
   if (rc != QRMI_RETURN_CODE_SUCCESS) {
-    fprintf(stderr, "failed to start a task.\n");
+    const char *last_error = qrmi_get_last_error();
+    fprintf(stderr, "failed to start a task. %s (%d)\n", last_error,
+            qrmi_get_last_error_kind());
+    qrmi_string_free((char *)last_error);
     free((void *)input);
     goto error;
   }
@@ -145,7 +164,12 @@ int main(int argc, char *argv[]) {
   qrmi_string_free((char *)job_id);
 
   rc = qrmi_resource_release(qrmi, acquisition_token);
-  fprintf(stdout, "qrmi_resource_release rc = %d\n", rc);
+  if (rc != QRMI_RETURN_CODE_SUCCESS) {
+    const char *last_error = qrmi_get_last_error();
+    fprintf(stdout, "qrmi_resource_release. %s (%d)\n", last_error,
+            qrmi_get_last_error_kind());
+    qrmi_string_free((char *)last_error);
+  }
   qrmi_string_free((char *)acquisition_token);
 
   qrmi_resource_free(qrmi);

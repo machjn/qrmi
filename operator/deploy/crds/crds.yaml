@@ -44,7 +44,6 @@ spec:
               resourceType:
                 description: QRMI resource type.
                 enum:
-                - direct-access
                 - ibm-quantum-system
                 - qiskit-runtime-service
                 - pasqal-cloud

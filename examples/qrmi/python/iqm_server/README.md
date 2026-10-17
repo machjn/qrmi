@@ -23,14 +23,35 @@ Because QRMI is an environment variable driven software library, all configurati
 | {qc_alias_name}_QRMI_IQM_ISA_TOKEN | IQM Server API token |
 
 > [!NOTE]
-> Replace the “:” in the QC alias name with “_” when specifying it. For example, `sirius:mock` -> `sirius_mock`.
+> Replace the ":" in the QC alias name with "_" when specifying it. For example, `sirius:mock` -> `sirius_mock`.
+
+## Alternative: create the resource from a config map
+
+Since QRMI v0.25.0, a resource can also be built from an explicit config dict
+instead of environment variables, via `QuantumResource.from_config()`:
+
+```python
+from qrmi import QuantumResource, ResourceType
+
+qrmi = QuantumResource.from_config(
+    "garnet_mock",
+    ResourceType.IQMServer,
+    {
+        "QRMI_IQM_ISA_ENDPOINT": "https://resonance.meetiqm.com",
+        "QRMI_IQM_ISA_TOKEN": "your api token",
+    },
+)
+```
+
+See the [0.25.0 migration guide](../../../../docs/migration/0.25.0.md) for
+the full set of required/optional keys per resource type.
 
 ## Create IQM JSON input file as input
 
-Refer [this tool](../../../task_runner/iqm) to generate. You can customize quantum circuits by editting the code.
+Refer [this tool](../../../task_runner/iqm) to generate. You can customize quantum circuits by editing the code.
 
 > [!NOTE]
-> Use the file with name ending with `_params_only.json`, e.g. `iqm_json_sirius_params_only.json`.
+> Use the file with name ending `_params_only.json`, e.g. `iqm_json_sirius_params_only.json`.
 
 ## How to run
 

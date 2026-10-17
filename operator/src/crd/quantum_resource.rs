@@ -27,7 +27,6 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum QrmiResourceType {
-    DirectAccess,
     IbmQuantumSystem,
     QiskitRuntimeService,
     PasqalCloud,

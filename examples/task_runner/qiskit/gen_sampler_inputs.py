@@ -1,6 +1,4 @@
-# -*- coding: utf-8 -*-
-
-# (C) Copyright 2025 IBM. All Rights Reserved.
+# (C) Copyright 2025, 2026 IBM. All Rights Reserved.
 #
 # This code is licensed under the Apache License, Version 2.0. You may
 # obtain a copy of this license in the LICENSE.txt file in the root directory
@@ -19,7 +17,13 @@ import argparse
 import requests
 
 import numpy as np
-from qiskit_ibm_runtime.utils import RuntimeEncoder
+
+try:
+    # qiskit-ibm-runtime >= 0.46
+    from qiskit_ibm_runtime import RuntimeEncoder
+except ModuleNotFoundError:
+    # qiskit_ibm_runtime < 0.46
+    from qiskit_ibm_runtime.utils import RuntimeEncoder
 from qiskit_ibm_runtime.utils.backend_converter import convert_to_target
 from qiskit_ibm_runtime.models import BackendProperties, BackendConfiguration
 from ibm_cloud_sdk_core.authenticators import IAMAuthenticator
@@ -34,7 +38,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument("backend", help="Backend name")
 parser.add_argument("base_url", help="API endpoint")
 parser.add_argument("apikey", help="IAM API key")
-parser.add_argument("crn", help="Service CRN of your instance")
+parser.add_argument("instance", help="Service CRN of your instance - starting with 'crn:v1:'")
 parser.add_argument(
     "--iam_url", help="IAM endpoint", default="https://iam.cloud.ibm.com"
 )
@@ -44,7 +48,7 @@ args = parser.parse_args()
 token_manager = IAMAuthenticator(apikey=args.apikey, url=args.iam_url).token_manager
 headers = {
     "Authorization": f"Bearer {token_manager.get_token()}",
-    "Service-CRN": args.crn,
+    "Service-CRN": args.instance,
 }
 print(json.dumps(headers, indent=2))
 

@@ -11,14 +11,14 @@
 // that they have been altered from the originals.
 
 use crate::models::{Payload, ResourceType, Target, TaskResult, TaskStatus};
-use crate::QuantumResource;
-use anyhow::{anyhow, bail, Result};
+use crate::pasqal::error::PasqalError;
+use crate::{QrmiError, QuantumResource, Result};
+use anyhow::Context;
 use log::{debug, warn};
 use pasqal_cloud_api::{Client, ClientBuilder, DeviceType, JobStatus};
 use std::collections::HashMap;
-use uuid::Uuid;
 
-use super::cloud_config::PasqalConfig;
+use super::cloud_config::PasqalCloudConfig;
 use async_trait::async_trait;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,14 +52,52 @@ impl PasqalCloud {
     ///
     /// # Config file fallback
     ///
-    /// * `~/.pasqal/config`: Optional fallback for `username`, `password`, `client_id`, `client_secret`, `token`, `project_id`, `auth_endpoint`
+    /// Credentials and `project_id` not set via the environment variables
+    /// above fall back to an INI-style config file (`key = value` lines,
+    /// `#`/`;` comments, case-insensitive keys): `username`, `password`,
+    /// `client_id`, `client_secret`, `token`, `project_id`,
+    /// `auth_endpoint`.
+    ///
+    /// The file is looked up at, in order, and only the first one found is
+    /// read (no merging across candidates):
+    ///
+    /// 1. `$PASQAL_CONFIG_ROOT/.pasqal/config`, falling back to
+    ///    `$<backend_name>_PASQAL_CONFIG_ROOT/.pasqal/config` if the unprefixed variable
+    ///    isn't set
+    /// 2. `$HOME/.pasqal/config`
     pub fn new(backend_name: &str) -> Result<Self> {
         debug!(
             "Initializing PasqalCloud QRMI for backend '{}'",
             backend_name
         );
+        let cfg = PasqalCloudConfig::from_opt(backend_name, None)?;
+        Self::from_pasqal_cloud_config(backend_name, cfg)
+    }
 
-        let cfg = PasqalConfig::read(backend_name)?;
+    /// Constructs a QRMI to access Pasqal Cloud Service from a config map,
+    /// instead of environment variables.
+    ///
+    /// Accepts the same keys as [`Self::new`]'s environment variables,
+    /// minus the `<backend_name>_` prefix. Each key also accepts its fully
+    /// lowercased form (e.g. `qrmi_pasqal_cloud_project_id`) as a fallback if the
+    /// exact-case key isn't present in the map.
+    ///
+    /// # Config file fallback
+    ///
+    /// Same lookup as [`Self::new`]'s "Config file fallback", except the
+    /// config root only comes from the map's unprefixed `PASQAL_CONFIG_ROOT`.
+    /// The `$HOME` fallback will not be read from the environment variables
+    /// but can still be explicitely set in the config with the `HOME` key.
+    pub fn from_config(backend_name: &str, config: HashMap<String, String>) -> Result<Self> {
+        let cfg = PasqalCloudConfig::from_opt(backend_name, Some(&config))?;
+        Self::from_pasqal_cloud_config(backend_name, cfg)
+    }
+
+    /// Builds the Pasqal Cloud API client from an already-resolved
+    /// [`PasqalCloudConfig`], shared by [`Self::new`] (resolved from env/file) and
+    /// [`Self::from_config`] (resolved from a config map) so the credential
+    /// precedence, client construction, and logging stay in one place.
+    fn from_pasqal_cloud_config(backend_name: &str, cfg: PasqalCloudConfig) -> Result<Self> {
         let project_id = cfg.project_id(backend_name).unwrap_or_default();
         let auth_token = cfg.auth_token(backend_name);
         let auth_endpoint = cfg.auth_endpoint(backend_name);
@@ -110,8 +148,8 @@ impl PasqalCloud {
 
     fn parse_device_type(&self) -> Result<DeviceType> {
         self.backend_name.parse::<DeviceType>().map_err(|_| {
-            anyhow!(
-                "Device '{}' is invalid. Valid devices: {}",
+            PasqalError::InvalidDeviceType(format!(
+                "device '{}' is invalid. Valid devices: {}",
                 self.backend_name,
                 [
                     "FRESNEL",
@@ -121,7 +159,8 @@ impl PasqalCloud {
                     "EMU_FRESNEL"
                 ]
                 .join(", ")
-            )
+            ))
+            .into()
         })
     }
 
@@ -175,7 +214,10 @@ impl PasqalCloud {
             .data
             .job_ids
             .first()
-            .ok_or_else(|| anyhow!("No jobs found for batch '{}'", batch_id))?;
+            .ok_or_else(|| QrmiError::TaskNotReady {
+                task_id: batch_id.to_string(),
+                reason: "no jobs found for this batch".to_string(),
+            })?;
         self.task_status_from_job_id(job_id).await
     }
 
@@ -216,22 +258,12 @@ impl QuantumResource for PasqalCloud {
         // The device may be down temporarily but jobs can still
         // be submitted and queued through the cloud.
         // Thus we only check that the device is not retired.
-        match self.api_client.get_device(device_type).await {
-            Ok(device) => Ok(device.availability == "ACTIVE"),
-            Err(err) => bail!("Failed to get device: {}", err),
-        }
-    }
-
-    async fn acquire(&mut self) -> Result<String> {
-        // TBD on cloud side for POC
-        // Pasqal Cloud does not support session concept, so simply returns dummy ID for now.
-        Ok(Uuid::new_v4().to_string())
-    }
-
-    async fn release(&mut self, _id: &str) -> Result<()> {
-        // TBD on cloud side for POC
-        // Pasqal Cloud does not support session concept, so simply ignores
-        Ok(())
+        let device = self
+            .api_client
+            .get_device(device_type)
+            .await
+            .context("failed to get device")?;
+        Ok(device.availability == "ACTIVE")
     }
 
     async fn task_start(&mut self, payload: Payload) -> Result<String> {
@@ -239,44 +271,29 @@ impl QuantumResource for PasqalCloud {
             "Starting task on PasqalCloud QRMI (backend '{}')",
             self.backend_name
         );
-        if let Payload::PasqalCloud { sequence, job_runs } = payload {
-            let device_type = self.parse_device_type()?;
+        let Payload::PasqalCloud { sequence, job_runs } = payload else {
+            return Err(QrmiError::UnsupportedPayload(format!("{payload:?}")));
+        };
+        let device_type = self.parse_device_type()?;
 
-            if Self::is_cudaq_sequence(&sequence) {
-                let sequence_value: serde_json::Value = match serde_json::from_str(&sequence) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        return Err(anyhow!("Failed to parse CUDA-Q sequence payload: {err}"));
-                    }
-                };
-                match self
-                    .api_client
-                    .create_cudaq_job(sequence_value, job_runs, device_type)
-                    .await
-                {
-                    Ok(job) => {
-                        self.task_kinds
-                            .insert(job.data.id.clone(), PasqalTaskKind::Cudaq);
-                        Ok(job.data.id)
-                    }
-                    Err(err) => Err(err),
-                }
-            } else {
-                match self
-                    .api_client
-                    .create_batch(sequence, job_runs, device_type)
-                    .await
-                {
-                    Ok(batch) => {
-                        self.task_kinds
-                            .insert(batch.data.id.clone(), PasqalTaskKind::Pulser);
-                        Ok(batch.data.id)
-                    }
-                    Err(err) => Err(err),
-                }
-            }
+        if Self::is_cudaq_sequence(&sequence) {
+            let sequence_value: serde_json::Value = serde_json::from_str(&sequence)
+                .map_err(|err| PasqalError::InvalidCudaqSequence(err.to_string()))?;
+            let job = self
+                .api_client
+                .create_cudaq_job(sequence_value, job_runs, device_type)
+                .await?;
+            self.task_kinds
+                .insert(job.data.id.clone(), PasqalTaskKind::Cudaq);
+            Ok(job.data.id)
         } else {
-            bail!(format!("Payload type is not supported. {:?}", payload))
+            let batch = self
+                .api_client
+                .create_batch(sequence, job_runs, device_type)
+                .await?;
+            self.task_kinds
+                .insert(batch.data.id.clone(), PasqalTaskKind::Pulser);
+            Ok(batch.data.id)
         }
     }
 
@@ -285,10 +302,8 @@ impl QuantumResource for PasqalCloud {
             "Stopping task '{}' on PasqalCloud QRMI (backend '{}')",
             task_id, self.backend_name
         );
-        match self.api_client.cancel_batch(task_id).await {
-            Ok(_) => Ok(()),
-            Err(err) => Err(err),
-        }
+        self.api_client.cancel_batch(task_id).await?;
+        Ok(())
     }
 
     async fn task_status(&mut self, task_id: &str) -> Result<TaskStatus> {
@@ -297,14 +312,11 @@ impl QuantumResource for PasqalCloud {
 
     async fn task_result(&mut self, task_id: &str) -> Result<TaskResult> {
         match self.task_kind(task_id) {
-            PasqalTaskKind::Pulser => match self.api_client.get_batch_results(task_id).await {
-                Ok(resp) => Ok(TaskResult { value: resp }),
-                Err(err) => Err(err),
-            },
-            PasqalTaskKind::Cudaq => match self.task_result_from_cudaq(task_id).await {
-                Ok(result) => Ok(result),
-                Err(err) => Err(err),
-            },
+            PasqalTaskKind::Pulser => {
+                let resp = self.api_client.get_batch_results(task_id).await?;
+                Ok(TaskResult { value: resp })
+            }
+            PasqalTaskKind::Cudaq => self.task_result_from_cudaq(task_id).await,
         }
     }
 
@@ -318,10 +330,8 @@ impl QuantumResource for PasqalCloud {
             self.backend_name
         );
         let device_type = self.parse_device_type()?;
-        match self.api_client.get_device_specs(device_type).await {
-            Ok(resp) => Ok(Target { value: resp }),
-            Err(err) => Err(err),
-        }
+        let resp = self.api_client.get_device_specs(device_type).await?;
+        Ok(Target { value: resp })
     }
 
     async fn metadata(&mut self) -> std::collections::HashMap<String, String> {

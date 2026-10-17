@@ -17,24 +17,11 @@ from pulser.backend.remote import JobParams
 from pulser.register import Register
 
 from qrmi.pulser.connection import PulserQRMIConnection
-from qrmi.pulser.service import QRMIService
 
 # Create QRMI
 load_dotenv()
-service = QRMIService()
 
-resources = service.resources()
-if len(resources) == 0:
-    raise RuntimeError("No quantum resource is available.")
-
-# Select QR
-for res in resources:
-    print(f"Available resource: id={res.resource_id()} type={str(res.resource_type())}")
-
-# For this example, we select the first resource
-qrmi = resources[0]
-
-qrmi_conn = PulserQRMIConnection(qrmi)
+qrmi_conn = PulserQRMIConnection()
 
 # Generate Pulser device.
 # Emulator targets may not expose device specs so we fall back to DigitalAnalogDevice.
@@ -70,7 +57,15 @@ seq.add(pulse1, "rydberg")
 seq.measure("ground-rydberg")
 
 backend = pulser.QPUBackend(seq, qrmi_conn)
-remote_results = backend.run([JobParams(runs=500, variables=[])], wait=True)
+remote_results: pulser.backend.RemoteResults = backend.run([JobParams(runs=500, variables=[])], wait=True)
 
-print(f"Logs: ", qrmi_conn.get_batch_logs(batch_id=remote_results.batch_id))
-print(f"Results: {remote_results.results}")
+available_logs = qrmi_conn.get_batch_logs(batch_id=remote_results.batch_id)
+available_results: pulser.backend.Results = remote_results.get_available_results()[remote_results.batch_id]
+
+# Printing logs and results
+print("\nLogs\n----")
+print(*available_logs)
+print(available_results)
+print("\nObservables\n-----------")
+for observable, result in available_results.get_tagged_results().items():
+    print(f"{observable}:", result)

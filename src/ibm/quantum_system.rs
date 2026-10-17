@@ -10,23 +10,27 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
-use crate::models::{Payload, ResourceType, Target, TaskResult, TaskStatus};
-use crate::QuantumResource;
-use anyhow::{anyhow, bail, Result};
+use crate::common::{resolve_opt, resolve_opt_required};
+use crate::error::QrmiError;
+use crate::ibm::error::IbmError;
+use crate::models::{
+    Payload, ResourceCapacity, ResourceStatus, ResourceStatusCode, ResourceType, Target,
+    TaskResult, TaskStatus,
+};
+use crate::{QuantumResource, Result};
 use log::info;
 use quantum_system_api::utils::s3::S3Client;
 use quantum_system_api::{
-    models::Backend, models::BackendStatus, models::Job, models::JobStatus, models::LogLevel,
-    models::ProgramId, AuthMethod, Client, ClientBuilder,
+    models::Backend, models::BackendLanesConfiguration, models::BackendStatus, models::Job,
+    models::JobStatus, models::Jobs, models::LogLevel, models::ProgramId, AuthMethod, Client,
+    ClientBuilder,
 };
 use reqwest_retry::policies::ExponentialBackoff;
 use reqwest_retry::Jitter;
 use serde_json::json;
 use std::collections::HashMap;
-use std::env;
 use std::str::FromStr;
 use std::time::Duration;
-use uuid::Uuid;
 
 use async_trait::async_trait;
 
@@ -34,6 +38,12 @@ use async_trait::async_trait;
 pub struct IBMQuantumSystem {
     pub(crate) api_client: Client,
     pub(crate) backend_name: String,
+    /// Where the `QRMI_IBM_QS_*` settings are read from. Kept so that
+    /// `QRMI_JOB_TIMEOUT_SECONDS` is read when `task_start` runs.
+    settings: Settings,
+    /// S3 bucket that job results and logs are read from. `None` if S3 was
+    /// not configured at construction.
+    s3: Option<S3Store>,
 }
 
 impl IBMQuantumSystem {
@@ -53,28 +63,30 @@ impl IBMQuantumSystem {
     /// * `QRMI_IBM_QS_SERVICE_CRN`: Provisioned Quantum System API Service instance
     /// * `QRMI_JOB_TIMEOUT_SECONDS`: Time (in seconds) after which job should time out and get cancelled.
     pub fn new(resource_id: &str) -> Result<Self> {
-        // Check to see if the environment variables required to run this program are set.
-        let daapi_endpoint =
-            env::var(format!("{resource_id}_QRMI_IBM_QS_ENDPOINT")).map_err(|_| {
-                anyhow!("{resource_id}_QRMI_IBM_QS_ENDPOINT environment variable is not set")
-            })?;
+        Self::from_settings(resource_id, Settings::env(resource_id))
+    }
 
-        let binding = ClientBuilder::new(daapi_endpoint);
-        let mut builder = binding;
+    /// Constructs a QRMI to access IBM Quantum System API Service from a
+    /// config map, instead of environment variables.
+    ///
+    /// Accepts the same keys as [`Self::new`]'s environment variables,
+    /// minus the `<resource_id>_` prefix. Each key also accepts its fully
+    /// lowercased form (e.g. `qrmi_ibm_qs_endpoint`) as a fallback if the
+    /// exact-case key isn't present in the map.
+    pub fn from_config(resource_id: &str, config: HashMap<String, String>) -> Result<Self> {
+        Self::from_settings(resource_id, Settings::map(config))
+    }
 
-        let apikey = env::var(format!("{resource_id}_QRMI_IBM_QS_IAM_APIKEY")).map_err(|_| {
-            anyhow!("{resource_id}_QRMI_IBM_QS_IAM_APIKEY environment variable is not set")
-        })?;
+    /// Shared logic for [`Self::new`] and [`Self::from_config`].
+    fn from_settings(resource_id: &str, settings: Settings) -> Result<Self> {
+        // Check to see if the settings required to run this program are set.
+        let daapi_endpoint = settings.require("QRMI_IBM_QS_ENDPOINT")?;
 
-        let service_crn =
-            env::var(format!("{resource_id}_QRMI_IBM_QS_SERVICE_CRN")).map_err(|_| {
-                anyhow!("{resource_id}_QRMI_IBM_QS_SERVICE_CRN environment variable is not set")
-            })?;
+        let mut builder = ClientBuilder::new(daapi_endpoint);
 
-        let iam_endpoint_url = env::var(format!("{resource_id}_QRMI_IBM_QS_IAM_ENDPOINT"))
-            .map_err(|_| {
-                anyhow!("{resource_id}_QRMI_IBM_QS_IAM_ENDPOINT environment variable is not set")
-            })?;
+        let apikey = settings.require("QRMI_IBM_QS_IAM_APIKEY")?;
+        let service_crn = settings.require("QRMI_IBM_QS_SERVICE_CRN")?;
+        let iam_endpoint_url = settings.require("QRMI_IBM_QS_IAM_ENDPOINT")?;
 
         let auth_method = AuthMethod::IbmCloudIam {
             apikey,
@@ -93,39 +105,125 @@ impl IBMQuantumSystem {
             .with_timeout(Duration::from_secs(60))
             .with_retry_policy(retry_policy);
 
-        let s3_endpoint_for_daapi =
-            env::var(format!("{resource_id}_QRMI_IBM_QS_S3_ENDPOINT_FOR_QSAPI")).ok();
+        let s3_endpoint_for_daapi = settings.get("QRMI_IBM_QS_S3_ENDPOINT_FOR_QSAPI");
 
-        if let (
-            Ok(aws_access_key_id),
-            Ok(aws_secret_access_key),
-            Ok(s3_endpoint),
-            Ok(s3_bucket),
-            Ok(s3_region),
-        ) = (
-            env::var(format!("{resource_id}_QRMI_IBM_QS_AWS_ACCESS_KEY_ID")),
-            env::var(format!("{resource_id}_QRMI_IBM_QS_AWS_SECRET_ACCESS_KEY")),
-            env::var(format!("{resource_id}_QRMI_IBM_QS_S3_ENDPOINT")),
-            env::var(format!("{resource_id}_QRMI_IBM_QS_S3_BUCKET")),
-            env::var(format!("{resource_id}_QRMI_IBM_QS_S3_REGION")),
-        ) {
-            builder.with_s3bucket(
-                &aws_access_key_id,
-                &aws_secret_access_key,
-                &s3_endpoint,
-                &s3_bucket,
-                &s3_region,
-                s3_endpoint_for_daapi,
-            );
-        } else {
-            info!("No S3 bucket configured.");
-        }
+        // S3 is optional: only the task_* methods need it. If it is configured,
+        // the API client uses it to upload job input, and our own S3 client
+        // uses it to download job results and logs.
+        let s3 = match s3_env(&settings) {
+            Ok(s3) => {
+                builder.with_s3bucket(
+                    &s3.access_key_id,
+                    &s3.secret_access_key,
+                    &s3.endpoint,
+                    &s3.bucket,
+                    &s3.region,
+                    s3_endpoint_for_daapi,
+                );
+                Some(S3Store {
+                    client: S3Client::new(
+                        s3.endpoint,
+                        s3.access_key_id,
+                        s3.secret_access_key,
+                        s3.region,
+                    ),
+                    bucket: s3.bucket,
+                })
+            }
+            Err(e) => {
+                info!("No S3 bucket configured ({e}).");
+                None
+            }
+        };
 
         Ok(Self {
-            api_client: builder.build().unwrap(),
+            api_client: builder.build()?,
             backend_name: resource_id.to_string(),
+            settings,
+            s3,
         })
     }
+
+    /// The S3 bucket, or an error if S3 was not configured at construction.
+    ///
+    /// The error is the one [`s3_env`] reports for the first missing setting
+    /// ([`QrmiError::EnvVarNotSet`] or [`QrmiError::MissingConfigKey`]).
+    fn s3_store(&self) -> Result<&S3Store> {
+        match &self.s3 {
+            Some(s3) => Ok(s3),
+            None => Err(s3_env(&self.settings).err().unwrap_or_else(|| {
+                // Only reachable if the settings were added after construction.
+                QrmiError::InvalidConfig(format!(
+                    "S3 bucket was not configured when '{}' was created",
+                    self.backend_name
+                ))
+            })),
+        }
+    }
+}
+
+/// Where the `QRMI_IBM_QS_*` settings are read from: OS environment variables
+/// prefixed with `<resource_id>_`, or an unprefixed config map (config maps are
+/// already scoped to one resource, so there's nothing to prefix).
+struct Settings {
+    prefix: String,
+    config: Option<HashMap<String, String>>,
+}
+
+impl Settings {
+    fn env(resource_id: &str) -> Self {
+        Self {
+            prefix: format!("{resource_id}_"),
+            config: None,
+        }
+    }
+
+    fn map(config: HashMap<String, String>) -> Self {
+        Self {
+            prefix: String::new(),
+            config: Some(config),
+        }
+    }
+
+    /// The full key looked up for `name`, as it appears in errors.
+    fn key(&self, name: &str) -> String {
+        format!("{}{name}", self.prefix)
+    }
+
+    fn get(&self, name: &str) -> Option<String> {
+        resolve_opt(&self.key(name), self.config.as_ref())
+    }
+
+    /// Like [`Self::get`], but a missing value is an error
+    /// ([`QrmiError::EnvVarNotSet`] or [`QrmiError::MissingConfigKey`]).
+    fn require(&self, name: &str) -> Result<String> {
+        resolve_opt_required(&self.key(name), self.config.as_ref())
+    }
+}
+
+/// S3 connection details, read once at construction.
+struct S3Env {
+    bucket: String,
+    endpoint: String,
+    access_key_id: String,
+    secret_access_key: String,
+    region: String,
+}
+
+fn s3_env(settings: &Settings) -> Result<S3Env> {
+    Ok(S3Env {
+        bucket: settings.require("QRMI_IBM_QS_S3_BUCKET")?,
+        endpoint: settings.require("QRMI_IBM_QS_S3_ENDPOINT")?,
+        access_key_id: settings.require("QRMI_IBM_QS_AWS_ACCESS_KEY_ID")?,
+        secret_access_key: settings.require("QRMI_IBM_QS_AWS_SECRET_ACCESS_KEY")?,
+        region: settings.require("QRMI_IBM_QS_S3_REGION")?,
+    })
+}
+
+/// S3 client and bucket that job results and logs are read from.
+struct S3Store {
+    client: S3Client,
+    bucket: String,
 }
 
 #[async_trait]
@@ -139,74 +237,78 @@ impl QuantumResource for IBMQuantumSystem {
     }
 
     async fn is_accessible(&mut self) -> Result<bool> {
-        match self
+        let backend = self
             .api_client
             .get_backend::<Backend>(&self.backend_name)
-            .await
-        {
-            Ok(val) => {
-                if matches!(val.status, BackendStatus::Online) {
-                    return Ok(true);
-                }
-                Ok(false)
-            }
-            Err(err) => {
-                bail!(format!("Failed to get backend details: {:#?}", &err));
-            }
-        }
+            .await?;
+        Ok(matches!(backend.status, BackendStatus::Online))
     }
 
-    async fn acquire(&mut self) -> Result<String> {
-        // Quantum System API does not support session concept, so simply returns dummy ID for now.
-        Ok(Uuid::new_v4().to_string())
-    }
+    async fn status(&mut self) -> Result<ResourceStatus> {
+        let (backend, lane_config, jobs) = tokio::try_join!(
+            self.api_client.get_backend::<Backend>(&self.backend_name),
+            self.api_client
+                .get_backend_lanes_configuration::<BackendLanesConfiguration>(&self.backend_name),
+            self.api_client.list_jobs::<Jobs>()
+        )?;
 
-    async fn release(&mut self, _id: &str) -> Result<()> {
-        // Quantum System API does not support session concept, so simply ignores
-        Ok(())
+        // `list_jobs` also returns finished jobs; only running ones occupy a lane.
+        let count = jobs
+            .jobs
+            .iter()
+            .filter(|job| job.backend == self.backend_name)
+            .filter(|job| matches!(job.status, JobStatus::Running))
+            .count() as u64;
+
+        let status = match backend.status {
+            BackendStatus::Online => ResourceStatusCode::Online,
+            BackendStatus::Offline => ResourceStatusCode::Offline,
+            BackendStatus::Paused => ResourceStatusCode::Paused,
+        };
+
+        Ok(ResourceStatus {
+            status,
+            status_reason: None,
+            busy: backend.locked,
+            healthy: None,
+            capacity: Some(ResourceCapacity {
+                available_slots: lane_config.hpc_workload_manager.lanes.saturating_sub(count),
+                max_slots: lane_config.hpc_workload_manager.lanes,
+            }),
+            pending_job_count: None,
+        })
     }
 
     async fn task_start(&mut self, payload: Payload) -> Result<String> {
-        let timeout_env_name = format!("{0}_QRMI_JOB_TIMEOUT_SECONDS", self.backend_name);
-        let timeout = env::var(&timeout_env_name)
-            .map_err(|_| anyhow!("{0} environment variable is not set", timeout_env_name))?;
+        let timeout = self.settings.require("QRMI_JOB_TIMEOUT_SECONDS")?;
+        let timeout_secs = timeout
+            .parse::<u64>()
+            .map_err(|source| QrmiError::ParseError {
+                name: self.settings.key("QRMI_JOB_TIMEOUT_SECONDS"),
+                value: timeout,
+                source: Box::new(source),
+            })?;
 
-        let timeout_secs = match timeout.parse::<u64>() {
-            Ok(val) => val,
-            Err(err) => {
-                bail!(format!("Failed to parse timeout value: {:#?}", &err));
-            }
+        let Payload::QiskitPrimitive { input, program_id } = payload else {
+            return Err(QrmiError::UnsupportedPayload(format!("{payload:?}")));
         };
 
-        if let Payload::QiskitPrimitive { input, program_id } = payload {
-            let job: serde_json::Value = serde_json::from_str(input.as_str())?;
-            if let Ok(program_id_enum) = ProgramId::from_str(&program_id) {
-                match self
-                    .api_client
-                    .run_primitive(
-                        &self.backend_name,
-                        program_id_enum,
-                        timeout_secs,
-                        LogLevel::Debug,
-                        &job,
-                        None,
-                    )
-                    .await
-                {
-                    Ok(val) => Ok(val.job_id),
-                    Err(err) => {
-                        bail!(format!(
-                            "An error occurred during starting a task: {:#?}",
-                            &err
-                        ));
-                    }
-                }
-            } else {
-                bail!(format!("Unknown program ID is specified. {}", &program_id));
-            }
-        } else {
-            bail!(format!("Payload type is not supported. {:?}", payload));
-        }
+        let job_input: serde_json::Value = serde_json::from_str(input.as_str())?;
+        let program_id_enum = ProgramId::from_str(&program_id)
+            .map_err(|_| IbmError::UnknownProgramId(program_id.clone()))?;
+
+        let job = self
+            .api_client
+            .run_primitive(
+                &self.backend_name,
+                program_id_enum,
+                timeout_secs,
+                LogLevel::Debug,
+                &job_input,
+                None,
+            )
+            .await?;
+        Ok(job.job_id)
     }
 
     async fn task_stop(&mut self, task_id: &str) -> Result<()> {
@@ -229,66 +331,34 @@ impl QuantumResource for IBMQuantumSystem {
     }
 
     async fn task_result(&mut self, task_id: &str) -> Result<TaskResult> {
-        let s3_bucket_env_name = format!("{0}_QRMI_IBM_QS_S3_BUCKET", self.backend_name);
-        let s3_bucket = env::var(&s3_bucket_env_name)
-            .map_err(|_| anyhow!("{0} environment variable is not set", s3_bucket_env_name))?;
-
-        let s3_endpoint_env_name = format!("{0}_QRMI_IBM_QS_S3_ENDPOINT", self.backend_name);
-        let s3_endpoint = env::var(&s3_endpoint_env_name)
-            .map_err(|_| anyhow!("{0} environment variable is not set", s3_endpoint_env_name))?;
-
-        let aws_access_key_id_env_name =
-            format!("{0}_QRMI_IBM_QS_AWS_ACCESS_KEY_ID", self.backend_name);
-        let aws_access_key_id = env::var(&aws_access_key_id_env_name).map_err(|_| {
-            anyhow!(
-                "{0} environment variable is not set",
-                aws_access_key_id_env_name
-            )
-        })?;
-
-        let aws_secret_access_key_env_name =
-            format!("{0}_QRMI_IBM_QS_AWS_SECRET_ACCESS_KEY", self.backend_name);
-        let aws_secret_access_key = env::var(&aws_secret_access_key_env_name).map_err(|_| {
-            anyhow!("{aws_secret_access_key_env_name} environment variable is not set")
-        })?;
-
-        let s3_region_env_name = format!("{0}_QRMI_IBM_QS_S3_REGION", self.backend_name);
-        let s3_region = env::var(&s3_region_env_name)
-            .map_err(|_| anyhow!("{s3_region_env_name} environment variable is not set"))?;
-
-        let s3_client = S3Client::new(
-            s3_endpoint,
-            aws_access_key_id,
-            aws_secret_access_key,
-            s3_region,
-        );
+        let s3 = self.s3_store()?;
 
         let job = self.api_client.get_job::<Job>(task_id).await?;
         if matches!(job.status, JobStatus::Failed) {
             let reason_code = job.reason_code.map_or("".to_string(), |v| v.to_string());
             let reason_message = job.reason_message.unwrap_or("".to_string());
             let reason_solution = job.reason_solution.unwrap_or("".to_string());
-            bail!(
-                format!(
-                    "Unable to retrieve result for task {}. Task failed. code: {}, message: {}, solution: {}",
-                    task_id, reason_code, reason_message, reason_solution
-                )
-            );
+            return Err(QrmiError::TaskNotReady {
+                task_id: task_id.to_string(),
+                reason: format!(
+                    "task failed. code: {reason_code}, message: {reason_message}, solution: {reason_solution}"
+                ),
+            });
         }
         if matches!(job.status, JobStatus::Cancelled) {
-            bail!(format!(
-                "Unable to retrieve result for task {}. Task was cancelled.",
-                task_id
-            ));
+            return Err(QrmiError::TaskNotReady {
+                task_id: task_id.to_string(),
+                reason: "task was cancelled".to_string(),
+            });
         }
         if matches!(job.status, JobStatus::Running) {
-            bail!(format!(
-                "Unable to retrieve result for task {}. Task is running.",
-                task_id
-            ));
+            return Err(QrmiError::TaskNotReady {
+                task_id: task_id.to_string(),
+                reason: "task is running".to_string(),
+            });
         }
         let s3_object_key = format!("results_{}.json", task_id);
-        let object = s3_client.get_object(&s3_bucket, &s3_object_key).await?;
+        let object = s3.client.get_object(&s3.bucket, &s3_object_key).await?;
         let retrieved_txt = String::from_utf8(object)?;
         Ok(TaskResult {
             value: retrieved_txt,
@@ -296,67 +366,26 @@ impl QuantumResource for IBMQuantumSystem {
     }
 
     async fn task_logs(&mut self, task_id: &str) -> Result<String> {
-        let s3_bucket_env_name = format!("{0}_QRMI_IBM_QS_S3_BUCKET", self.backend_name);
-        let s3_bucket = env::var(&s3_bucket_env_name)
-            .map_err(|_| anyhow!("{0} environment variable is not set", s3_bucket_env_name))?;
-
-        let s3_endpoint_env_name = format!("{0}_QRMI_IBM_QS_S3_ENDPOINT", self.backend_name);
-        let s3_endpoint = env::var(&s3_endpoint_env_name)
-            .map_err(|_| anyhow!("{0} environment variable is not set", s3_endpoint_env_name))?;
-
-        let aws_access_key_id_env_name =
-            format!("{0}_QRMI_IBM_QS_AWS_ACCESS_KEY_ID", self.backend_name);
-        let aws_access_key_id = env::var(&aws_access_key_id_env_name).map_err(|_| {
-            anyhow!(
-                "{0} environment variable is not set",
-                aws_access_key_id_env_name
-            )
-        })?;
-
-        let aws_secret_access_key_env_name =
-            format!("{0}_QRMI_IBM_QS_AWS_SECRET_ACCESS_KEY", self.backend_name);
-        let aws_secret_access_key = env::var(&aws_secret_access_key_env_name).map_err(|_| {
-            anyhow!("{aws_secret_access_key_env_name} environment variable is not set")
-        })?;
-
-        let s3_region_env_name = format!("{0}_QRMI_IBM_QS_S3_REGION", self.backend_name);
-        let s3_region = env::var(&s3_region_env_name)
-            .map_err(|_| anyhow!("{s3_region_env_name} environment variable is not set"))?;
-
-        let s3_client = S3Client::new(
-            s3_endpoint,
-            aws_access_key_id,
-            aws_secret_access_key,
-            s3_region,
-        );
+        let s3 = self.s3_store()?;
 
         let s3_object_key = format!("logs_{}.json", task_id);
-        let object = s3_client.get_object(&s3_bucket, &s3_object_key).await?;
+        let object = s3.client.get_object(&s3.bucket, &s3_object_key).await?;
         let retrieved_txt = String::from_utf8(object)?;
         Ok(retrieved_txt)
     }
 
     async fn target(&mut self) -> Result<Target> {
-        let mut resp = json!({});
-        if let Ok(config) = self
-            .api_client
-            .get_backend_configuration::<serde_json::Value>(&self.backend_name)
-            .await
-        {
-            resp["configuration"] = config;
-        } else {
-            resp["configuration"] = json!(null);
-        }
+        let (config, props) = tokio::try_join!(
+            self.api_client
+                .get_backend_configuration::<serde_json::Value>(&self.backend_name),
+            self.api_client
+                .get_backend_properties::<serde_json::Value>(&self.backend_name),
+        )?;
 
-        if let Ok(props) = self
-            .api_client
-            .get_backend_properties::<serde_json::Value>(&self.backend_name)
-            .await
-        {
-            resp["properties"] = props;
-        } else {
-            resp["properties"] = json!(null);
-        }
+        let resp = json!({
+            "configuration": config,
+            "properties": props,
+        });
 
         Ok(Target {
             value: resp.to_string(),

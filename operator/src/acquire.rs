@@ -30,7 +30,7 @@ use tokio::time::{timeout, Duration};
 use tracing::instrument;
 
 use qrmi::alice_bob::AliceBobFelis;
-use qrmi::ibm::{IBMDirectAccess, IBMQiskitRuntimeService, IBMQuantumSystem};
+use qrmi::ibm::{IBMQiskitRuntimeService, IBMQuantumSystem};
 use qrmi::iqm::IQMServer;
 use qrmi::pasqal::{PasqalCloud, PasqalLocal};
 use qrmi::QuantumResource;
@@ -195,11 +195,6 @@ async fn do_release(spec: &QuantumResourceSpec, token: &str) -> Result<()> {
 fn build_backend(spec: &QuantumResourceSpec) -> Result<Box<dyn QuantumResource>> {
     let id = &spec.resource_id;
     let backend: Box<dyn QuantumResource> = match spec.resource_type {
-        QrmiResourceType::DirectAccess => {
-            Box::new(IBMDirectAccess::new(id).with_context(|| {
-                format!("constructing IBMDirectAccess for {id}")
-            })?)
-        }
         QrmiResourceType::IbmQuantumSystem => {
             Box::new(IBMQuantumSystem::new(id).with_context(|| {
                 format!("constructing IBMQuantumSystem for {id}")

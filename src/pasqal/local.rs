@@ -10,14 +10,12 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
+use crate::common::{required_env, resolve_opt, resolve_opt_required};
 use crate::models::{Payload, ResourceType, Target, TaskResult, TaskStatus};
-use crate::QuantumResource;
-use anyhow::anyhow;
-use anyhow::{bail, Result};
+use crate::{QrmiError, QuantumResource, Result};
 use log::warn;
 use pasqal_local_api::{Client, ClientBuilder, JobStatus};
 use std::collections::HashMap;
-use std::env;
 
 use async_trait::async_trait;
 
@@ -38,26 +36,60 @@ impl PasqalLocal {
     ///
     /// # Environment variables
     /// * `QRMI_JOB_UID`: uid of the slurm job
+    /// * `QRMI_JOB_ID`: id of the slurm job
     /// * `<backend_name>_QRMI_WARDEN_URL`: URL of the pasqd middleware (warden).
     ///   Falls back to the deprecated `<backend_name>_QRMI_URL` if not set.
     ///
     pub fn new(backend_name: &str) -> Result<Self> {
-        let warden_url_var = format!("{backend_name}_QRMI_WARDEN_URL");
-        let legacy_url_var = format!("{backend_name}_QRMI_URL");
-        let url = match env::var(&warden_url_var) {
-            Ok(url) => url,
-            Err(_) => {
-                let url = env::var(&legacy_url_var)
-                    .map_err(|_| anyhow!("{warden_url_var} environment variable is not set"))?;
-                warn!("{legacy_url_var} is deprecated, please use {warden_url_var} instead.");
-                url
-            }
+        Self::from_opt(backend_name, None)
+    }
+
+    /// Constructs a QRMI to access Pasqal on prem QPU from a config map,
+    /// instead of environment variables.
+    ///
+    /// Accepts the same keys as [`Self::new`]'s environment variables,
+    /// minus the `<backend_name>_` prefix. Each key also accepts its fully
+    /// lowercased form (e.g. `qrmi_warden_url`) as a fallback if the
+    /// exact-case key isn't present in the map.
+    pub fn from_config(backend_name: &str, config: HashMap<String, String>) -> Result<Self> {
+        Self::from_opt(backend_name, Some(&config))
+    }
+
+    /// Shared parsing logic for [`Self::new`] (`config: None`, reads OS
+    /// environment variables) and [`Self::from_config`] (`config: Some`,
+    /// reads the given map). The two differ only in where a value comes
+    /// from.
+    fn from_opt(backend_name: &str, config: Option<&HashMap<String, String>>) -> Result<Self> {
+        // Env vars are per-instance (`<backend_name>_QRMI_...`); config map
+        // keys use the same name minus that prefix.
+        let prefix = if config.is_some() {
+            String::new()
+        } else {
+            format!("{backend_name}_")
         };
-        let job_uid: i32 = env::var("QRMI_JOB_UID")
-            .ok()
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap();
-        let job_id: String = env::var("QRMI_JOB_ID").ok().unwrap();
+        let warden_url_var = format!("{prefix}QRMI_WARDEN_URL");
+        let legacy_url_var = format!("{prefix}QRMI_URL");
+        let url = match resolve_opt_required(&warden_url_var, config) {
+            Ok(url) => url,
+            Err(err) => match resolve_opt(&legacy_url_var, config) {
+                Some(url) => {
+                    warn!("{legacy_url_var} is deprecated, please use {warden_url_var} instead.");
+                    url
+                }
+                None => return Err(err),
+            },
+        };
+        let job_uid_str = resolve_opt_required("QRMI_JOB_UID", config)?;
+        let job_uid: i32 = job_uid_str
+            .parse()
+            .map_err(|source| QrmiError::ParseError {
+                name: "QRMI_JOB_UID".to_string(),
+                value: job_uid_str,
+                source: Box::new(source),
+            })?;
+
+        let job_id = resolve_opt_required("QRMI_JOB_ID", config)?;
+
         Ok(Self {
             api_client: ClientBuilder::new(url).build().unwrap(),
             backend_name: backend_name.to_string(),
@@ -78,99 +110,74 @@ impl QuantumResource for PasqalLocal {
     }
 
     async fn is_accessible(&mut self) -> Result<bool> {
-        match self.api_client.get_accessible().await {
-            Ok(accessible) => Ok(accessible.is_accessible),
-            Err(err) => Err(err),
-        }
+        let accessible = self.api_client.get_accessible().await?;
+        Ok(accessible.is_accessible)
     }
 
     async fn acquire(&mut self) -> Result<String> {
-        match self
+        let session = self
             .api_client
             .create_session(self.job_uid, &self.job_id)
-            .await
-        {
-            Ok(session) => Ok(session.id),
-            Err(err) => Err(err),
-        }
+            .await?;
+        Ok(session.id)
     }
 
     async fn release(&mut self, _id: &str) -> Result<()> {
         let token_var = format!("{}_QRMI_JOB_ACQUISITION_TOKEN", self.backend_name);
-        let session_id = env::var(&token_var)
-            .map_err(|_| anyhow!("{token_var} environment variable is not set"))?;
-        match self.api_client.revoke_session(&session_id).await {
-            Ok(_) => Ok(()),
-            Err(err) => Err(err),
-        }
+        let session_id = required_env(&token_var)?;
+        self.api_client.revoke_session(&session_id).await?;
+        Ok(())
     }
 
     async fn task_start(&mut self, payload: Payload) -> Result<String> {
         let token_var = format!("{}_QRMI_JOB_ACQUISITION_TOKEN", self.backend_name);
-        let session_id = env::var(&token_var)
-            .map_err(|_| anyhow!("{token_var} environment variable is not set"))?;
+        let session_id = required_env(&token_var)?;
 
-        if let Payload::PasqalCloud { sequence, job_runs } = payload {
-            match self
-                .api_client
-                .create_job(sequence, job_runs, &session_id)
-                .await
-            {
-                Ok(job) => Ok(job.id.to_string()),
-                Err(err) => Err(err),
-            }
-        } else {
-            bail!(format!("Payload type is not supported. {:?}", payload))
-        }
+        let Payload::PasqalCloud { sequence, job_runs } = payload else {
+            return Err(QrmiError::UnsupportedPayload(format!("{payload:?}")));
+        };
+        let job = self
+            .api_client
+            .create_job(sequence, job_runs, &session_id)
+            .await?;
+        Ok(job.id.to_string())
     }
 
     async fn task_stop(&mut self, task_id: &str) -> Result<()> {
-        match self.api_client.cancel_job(task_id).await {
-            Ok(_) => Ok(()),
-            Err(err) => Err(err),
-        }
+        self.api_client.cancel_job(task_id).await?;
+        Ok(())
     }
 
     async fn task_status(&mut self, task_id: &str) -> Result<TaskStatus> {
-        match self.api_client.get_job(task_id).await {
-            Ok(job) => {
-                let status = match job.status {
-                    JobStatus::Pending => TaskStatus::Queued,
-                    JobStatus::Running => TaskStatus::Running,
-                    JobStatus::Done => TaskStatus::Completed,
-                    JobStatus::Canceled => TaskStatus::Cancelled,
-                    JobStatus::Error => TaskStatus::Failed,
-                };
-                return Ok(status);
-            }
-            Err(err) => Err(err),
-        }
+        let job = self.api_client.get_job(task_id).await?;
+        Ok(match job.status {
+            JobStatus::Pending => TaskStatus::Queued,
+            JobStatus::Running => TaskStatus::Running,
+            JobStatus::Done => TaskStatus::Completed,
+            JobStatus::Canceled => TaskStatus::Cancelled,
+            JobStatus::Error => TaskStatus::Failed,
+        })
     }
 
     async fn task_result(&mut self, task_id: &str) -> Result<TaskResult> {
-        match self.api_client.get_job(task_id).await {
-            Ok(job) => {
-                let Some(results) = job.results else {
-                    bail!("Results not available. Current status: {:?}.", job.status);
-                };
-                Ok(TaskResult { value: results })
-            }
-            Err(err) => Err(err),
-        }
+        let job = self.api_client.get_job(task_id).await?;
+        let Some(results) = job.results else {
+            return Err(QrmiError::TaskNotReady {
+                task_id: task_id.to_string(),
+                reason: format!("results not available (current status: {:?})", job.status),
+            });
+        };
+        Ok(TaskResult { value: results })
     }
 
     async fn task_logs(&mut self, task_id: &str) -> Result<String> {
-        match self.api_client.get_task_logs(task_id).await {
-            Ok(resp) => Ok(resp.logs),
-            Err(err) => Err(err),
-        }
+        let resp = self.api_client.get_task_logs(task_id).await?;
+        Ok(resp.logs)
     }
 
     async fn target(&mut self) -> Result<Target> {
-        match self.api_client.get_device_specs().await {
-            Ok(resp) => Ok(Target { value: resp }),
-            Err(err) => Err(err),
-        }
+        let resp = self.api_client.get_device_specs().await?;
+        Ok(Target { value: resp })
     }
 
     async fn metadata(&mut self) -> HashMap<String, String> {
@@ -179,3 +186,7 @@ impl QuantumResource for PasqalLocal {
         metadata
     }
 }
+
+#[cfg(test)]
+#[path = "tests/local.rs"]
+mod tests;
