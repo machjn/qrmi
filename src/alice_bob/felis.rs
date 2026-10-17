@@ -78,7 +78,12 @@ impl AliceBobFelis {
             resolve_opt_required_any(&[&prefixed_endpoint, "QRMI_AB_FELIS_BASE_ENDPOINT"], config)?;
         let mut config = configuration::Configuration::new();
         config.base_path = endpoint;
-        config.basic_auth = decode_api_key(&api_key).unwrap();
+        // Don't include the key itself in the error: it ends up in logs.
+        config.basic_auth = decode_api_key(&api_key).map_err(|e| {
+            QrmiError::InvalidConfig(format!(
+                "QRMI_AB_FELIS_API_KEY is not a valid Felis API key: {e}"
+            ))
+        })?;
         Ok(Self {
             config,
             backend_name: backend_name.to_string(),
@@ -227,3 +232,7 @@ impl QuantumResource for AliceBobFelis {
         metadata
     }
 }
+
+#[cfg(test)]
+#[path = "tests/felis.rs"]
+mod tests;
