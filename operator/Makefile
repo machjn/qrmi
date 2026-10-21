@@ -10,7 +10,7 @@
 #
 #   make example    build + load the Alice & Bob Felis example image, create
 #                   the credentials secret and QuantumResource, then run the
-#                   example Job and print its output
+#                   example Job (in EXAMPLE_NAMESPACE) and print its output
 #                   (needs QRMI_AB_FELIS_API_KEY on first run)
 
 SHELL := /bin/bash
@@ -26,6 +26,10 @@ CONTAINER_TOOL ?= podman
 IMAGE          ?= docker.io/library/qrmi-operator:latest
 EXAMPLE_IMAGE  ?= docker.io/library/felis-qrmi-example:latest
 ARCHIVE_DIR    := $(ROOT_DIR)/target/kind
+
+# Namespace the example Job runs in. Deliberately not the operator namespace:
+# credentials stay in $(NAMESPACE) and the Job can live anywhere.
+EXAMPLE_NAMESPACE ?= qrmi-example
 
 # Names used by the manifests in deploy/resources/.
 EXAMPLE_JOB     := alice-bob-felis-example
@@ -117,22 +121,23 @@ example-resource:
 # Jobs are immutable, so delete any previous run before re-creating it, then
 # wait for it to complete or fail and print its output.
 example-run:
-	$(KUBECTL) -n $(NAMESPACE) delete job $(EXAMPLE_JOB) --ignore-not-found --wait
-	$(KUBECTL) -n $(NAMESPACE) apply -f deploy/resources/alice-bob-felis-job-annotation.yaml
+	$(KUBECTL) create namespace $(EXAMPLE_NAMESPACE) --dry-run=client -o yaml | $(KUBECTL) apply -f -
+	$(KUBECTL) -n $(EXAMPLE_NAMESPACE) delete job $(EXAMPLE_JOB) --ignore-not-found --wait
+	$(KUBECTL) -n $(EXAMPLE_NAMESPACE) apply -f deploy/resources/alice-bob-felis-job-annotation.yaml
 	@echo "waiting up to $(EXAMPLE_TIMEOUT)s for job/$(EXAMPLE_JOB)..."
 	@for ((i = 0; i < $(EXAMPLE_TIMEOUT); i += 2)); do \
-		state=$$($(KUBECTL) -n $(NAMESPACE) get job $(EXAMPLE_JOB) \
+		state=$$($(KUBECTL) -n $(EXAMPLE_NAMESPACE) get job $(EXAMPLE_JOB) \
 			-o jsonpath='{.status.conditions[?(@.status=="True")].type}'); \
 		case "$$state" in \
-			*Complete*) $(KUBECTL) -n $(NAMESPACE) logs job/$(EXAMPLE_JOB); exit 0 ;; \
-			*Failed*) $(KUBECTL) -n $(NAMESPACE) logs job/$(EXAMPLE_JOB); \
+			*Complete*) $(KUBECTL) -n $(EXAMPLE_NAMESPACE) logs job/$(EXAMPLE_JOB); exit 0 ;; \
+			*Failed*) $(KUBECTL) -n $(EXAMPLE_NAMESPACE) logs job/$(EXAMPLE_JOB); \
 				echo "job/$(EXAMPLE_JOB) failed" >&2; exit 1 ;; \
 		esac; \
 		sleep 2; \
 	done; \
 	echo "timed out waiting for job/$(EXAMPLE_JOB)" >&2; \
-	$(KUBECTL) -n $(NAMESPACE) describe job $(EXAMPLE_JOB) | tail -20; \
+	$(KUBECTL) -n $(EXAMPLE_NAMESPACE) describe job $(EXAMPLE_JOB) | tail -20; \
 	exit 1
 
 example-logs:
-	$(KUBECTL) -n $(NAMESPACE) logs job/$(EXAMPLE_JOB)
+	$(KUBECTL) -n $(EXAMPLE_NAMESPACE) logs job/$(EXAMPLE_JOB)
