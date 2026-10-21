@@ -72,9 +72,17 @@ async fn run_operator() -> Result<()> {
     let client = Client::try_default().await?;
     info!("connected to Kubernetes API server");
 
+    // Admin credential Secrets referenced by QuantumResources live in the
+    // operator's namespace. In-cluster this is the service account's namespace;
+    // QRMI_OPERATOR_NAMESPACE overrides it (e.g. when running out of cluster).
+    let operator_namespace = std::env::var("QRMI_OPERATOR_NAMESPACE")
+        .unwrap_or_else(|_| client.default_namespace().to_string());
+    info!(namespace = %operator_namespace, "operator namespace");
+
     // --- QuantumResourceClaim controller ---
     let claim_ctx = Arc::new(controllers::resource_claim::Context {
         client: client.clone(),
+        operator_namespace,
     });
     let claims_api: Api<QuantumResourceClaim> = Api::all(client.clone());
     let claim_controller = Controller::new(claims_api, WatcherConfig::default())

@@ -39,6 +39,10 @@ const REQUEUE_BOUND_POLL: Duration = Duration::from_secs(60);
 /// Shared operator state passed to every reconciler invocation.
 pub struct Context {
     pub client: Client,
+    /// Namespace the operator runs in. QuantumResources are cluster-scoped, so
+    /// their admin credential Secrets (`secretRefs`) are read from here rather
+    /// than from the claim's namespace.
+    pub operator_namespace: String,
 }
 
 #[instrument(skip(ctx, claim), fields(name = %claim.name_any(), ns = claim.namespace().as_deref().unwrap_or("-")))]
@@ -53,7 +57,7 @@ pub async fn reconcile(
     if claim.metadata.deletion_timestamp.is_some() {
         if has_finalizer(&claim) {
             if let Err(e) = cleanup(&claim, &ctx).await {
-                error!("cleanup error: {e}");
+                error!("cleanup error: {e:#}");
             }
             remove_finalizer(&claims_api, &claim.name_any()).await?;
         }
@@ -133,11 +137,11 @@ async fn handle_pending(
         }
     };
 
-    let secrets_api: Api<Secret> = Api::namespaced(ctx.client.clone(), ns);
-    let env_vars = match acquire::resolve_env_vars(&qr.spec, &secrets_api).await {
+    let creds_api: Api<Secret> = Api::namespaced(ctx.client.clone(), &ctx.operator_namespace);
+    let env_vars = match acquire::resolve_env_vars(&qr.spec, &creds_api).await {
         Ok(v) => v,
         Err(e) => {
-            warn!(claim = %claim.name_any(), resource = %resource_name, "failed to resolve env vars: {e}");
+            warn!(claim = %claim.name_any(), resource = %resource_name, secrets_ns = %ctx.operator_namespace, "failed to resolve env vars: {e:#}");
             patch_status(
                 ctx,
                 ns,
@@ -146,7 +150,10 @@ async fn handle_pending(
                 None,
                 None,
                 None,
-                Some(format!("env var resolution failed: {e}")),
+                Some(format!(
+                    "env var resolution failed (secrets are read from namespace {}): {e:#}",
+                    ctx.operator_namespace
+                )),
             )
             .await?;
             return Ok(Action::requeue(REQUEUE_ON_PENDING));
@@ -156,7 +163,7 @@ async fn handle_pending(
     let token = match acquire::acquire(&qr.spec, &env_vars).await {
         Ok(t) => t,
         Err(e) => {
-            warn!(claim = %claim.name_any(), resource = %resource_name, "acquire failed (will retry): {e}");
+            warn!(claim = %claim.name_any(), resource = %resource_name, "acquire failed (will retry): {e:#}");
             patch_status(
                 ctx,
                 ns,
@@ -165,7 +172,7 @@ async fn handle_pending(
                 None,
                 None,
                 None,
-                Some(format!("acquire failed (will retry): {e}")),
+                Some(format!("acquire failed (will retry): {e:#}")),
             )
             .await?;
             return Ok(Action::requeue(REQUEUE_ON_PENDING));
@@ -272,12 +279,14 @@ async fn cleanup(claim: &QuantumResourceClaim, ctx: &Arc<Context>) -> Result<()>
                     if let Some(data) = &secret.data {
                         if let Some(token_bytes) = data.get(&token_key) {
                             if let Ok(token) = String::from_utf8(token_bytes.0.clone()) {
-                                let env_vars = acquire::resolve_env_vars(&qr.spec, &secrets_api)
+                                let creds_api: Api<Secret> =
+                                    Api::namespaced(ctx.client.clone(), &ctx.operator_namespace);
+                                let env_vars = acquire::resolve_env_vars(&qr.spec, &creds_api)
                                     .await
                                     .unwrap_or_default();
                                 if let Err(e) = acquire::release(&qr.spec, &env_vars, &token).await
                                 {
-                                    warn!(claim = %claim.name_any(), "release failed (continuing cleanup): {e}");
+                                    warn!(claim = %claim.name_any(), "release failed (continuing cleanup): {e:#}");
                                 } else {
                                     info!(claim = %claim.name_any(), resource = %claim.spec.quantum_resource, "released quantum resource lock");
                                 }

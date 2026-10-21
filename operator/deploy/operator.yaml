@@ -34,6 +34,12 @@ spec:
             capabilities:
               drop: ["ALL"]
           env:
+            # Namespace holding the admin credential Secrets referenced by
+            # QuantumResources (secretRefs).
+            - name: QRMI_OPERATOR_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: RUST_LOG
               value: "qrmi_operator=info,kube_client=error,kube_runtime=error,tower=error,hyper=error,warn"
           resources:

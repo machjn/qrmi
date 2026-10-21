@@ -47,7 +47,8 @@ kubectl apply -f operator/deploy/operator.yaml -n $QRMI_NAMESPACE
 
 ## Configure a Quantum Resource
 
-The quantum resource reads the API key from a secret that needs to be created first:
+The quantum resource reads the API key from a secret that needs to be created first.
+Credential secrets referenced by a QuantumResource always live in the operator's namespace:
 
 ```
 export QRMI_AB_FELIS_API_KEY=<your_api_key>
@@ -57,14 +58,16 @@ kubectl apply -f operator/deploy/resources/alice-bob-felis-qr.yaml
 
 ## Run a Job
 
-For now we'll use the same namespace the operator is installed in 
+Jobs can run in any namespace; the operator creates the claim and its `qrc-*` secret in the Job's namespace:
 
 ```
-kubectl apply -f operator/deploy/resources/alice-bob-felis-job-annotation.yaml -n $QRMI_NAMESPACE
+export JOB_NAMESPACE=qrmi-example # any namespace
+kubectl create namespace $JOB_NAMESPACE
+kubectl apply -f operator/deploy/resources/alice-bob-felis-job-annotation.yaml -n $JOB_NAMESPACE
 ```
 
 View output:
 
 ```
-kubectl logs jobs/alice-bob-felis-example -n $QRMI_NAMESPACE
+kubectl logs jobs/alice-bob-felis-example -n $JOB_NAMESPACE
 ```

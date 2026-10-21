@@ -40,9 +40,7 @@ pub enum QrmiResourceType {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretEnvRef {
-    /// Name of the Kubernetes Secret (in the same namespace as the claim,
-    /// or cluster-level for cluster-scoped resources — the operator resolves
-    /// this in the operator's own namespace).
+    /// Name of the Kubernetes Secret, in the operator's namespace.
     pub secret_name: String,
     /// Key within the Secret's `data` map.
     pub secret_key: String,
