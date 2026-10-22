@@ -39,6 +39,7 @@ mod acquire;
 mod controllers;
 mod crd;
 mod error;
+mod workload_env;
 
 use crd::{QuantumResource, QuantumResourceClaim};
 

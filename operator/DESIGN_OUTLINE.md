@@ -56,6 +56,17 @@ It tells the controller to acquire a Quantum Resource and inject the relevant en
 - Released: `qrmi.release()` has been called and cleanup is in progress. Never in this state for very long
 - Failed. Not yet hooked up. Should add a max retries so we dont acquire on an infinite loop
 
+The secret holds the same environment the SPANK plugin gives a Slurm job, so a workload finds its resource with `QRMIService().resources()` and doesn't acquire, release or name the resource itself:
+
+- `QRMI_JOB_QPU_RESOURCES` and `QRMI_JOB_QPU_TYPES` (and the legacy `SLURM_JOB_QPU_*` names): the resource ID and its QRMI type
+- `QRMI_JOB_ID`: the owning Job's UID, or the claim's for a claim made by hand
+- `QRMI_JOB_UID`: the pod's `runAsUser`, only when the Job sets one (Pasqal Local needs it)
+- `<resource_id>_<key>`: each of the QuantumResource's `envVars` and `secretRefs`
+- `<resource_id>_QRMI_JOB_ACQUISITION_TOKEN`: the token from `acquire()`
+- `<resource_id>_QRMI_JOB_TIMEOUT_SECONDS`: the shorter of the claim's TTL and the Job's `activeDeadlineSeconds`, or 4294967295 when neither is set, as SPANK does for a job without a time limit
+
+The prefix is the resource ID exactly as written, like SPANK, since that's where QRMI looks. One resource per pod: if a pod reads several claims' secrets, the last one's `QRMI_JOB_QPU_*` wins.
+
 This is the core of the architecture. The controller continuously monitors these resources and reconciles their state.
 
 ### Job Annotations
@@ -152,7 +163,8 @@ Lastly, the controller will delete claims when they exceed their `ttl` field.
     - A related object changes — e.g. kube-rs watches() configuration lets you trigger reconciliation of a parent when a child changes
     - Explicit Action::requeue() timer fires
     - Periodic full resync
-- Bug: currently can only execute from operator namespace as operator searches for qr secret in the tenant namespace
+- Bug: currently can only execute from operator namespace as operator searches for qr secret in the tenant namespace (fixed)
 - Question of RBAC and access
   - Right now anyone can create a quantum resource as its not namespaced. Maybe it should be be namespaced and only those in the admin namespace are considered?
   - there's a sense in which this operator is just a glorified secret distributor. Anyone who can create a claim gets a secret. Is this ok? how does this compare to Slurm risk model?
+- multiple quantum resources for a single job like Slurm can

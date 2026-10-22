@@ -12,7 +12,8 @@
 
 //! Controller for `QuantumResourceClaim` objects.
 //! The controller also manages a Kubernetes Secret named `qrc-<claim-name>`
-//! in the same namespace, containing all resolved environment variables.
+//! in the same namespace, holding the environment the QRMI SPANK plugin would
+//! give a Slurm job (see [`crate::workload_env`]).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Utc;
+use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta as K8sObjectMeta;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -31,6 +33,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::acquire;
 use crate::crd::{ClaimPhase, QuantumResource, QuantumResourceClaim, QuantumResourceClaimStatus};
 use crate::error::ControllerError;
+use crate::workload_env;
 
 const FINALIZER: &str = "quantum.qrmi.io/finalizer";
 const REQUEUE_ON_PENDING: Duration = Duration::from_secs(15);
@@ -160,7 +163,26 @@ async fn handle_pending(
         }
     };
 
-    let token = match acquire::acquire(&qr.spec, &env_vars).await {
+    // An annotated Job's claim describes that Job's workload; a claim made by
+    // hand describes itself.
+    let owner_job = match owner_job_name(claim) {
+        Some(job_name) => Some(
+            Api::<Job>::namespaced(ctx.client.clone(), ns)
+                .get(&job_name)
+                .await?,
+        ),
+        None => None,
+    };
+    let workload = workload_env::workload_for(
+        &claim.uid().unwrap_or_default(),
+        claim.spec.ttl,
+        owner_job.as_ref(),
+    );
+    // SPANK sets the job variables before acquiring, and Pasqal Local needs them.
+    let mut acquire_env = env_vars.clone();
+    acquire_env.extend(workload_env::job_env(&workload));
+
+    let token = match acquire::acquire(&qr.spec, &acquire_env).await {
         Ok(t) => t,
         Err(e) => {
             warn!(claim = %claim.name_any(), resource = %resource_name, "acquire failed (will retry): {e:#}");
@@ -184,16 +206,7 @@ async fn handle_pending(
         .secret_name
         .clone()
         .unwrap_or_else(|| secret_name_for(&claim.name_any()));
-    let resource_prefix = qr.spec.resource_id.to_lowercase().replace('-', "_");
-    let mut secret_data: BTreeMap<String, String> = env_vars
-        .clone()
-        .into_iter()
-        .map(|(k, v)| (format!("{resource_prefix}_{k}"), v))
-        .collect();
-    secret_data.insert(
-        format!("{resource_prefix}_QRMI_JOB_ACQUISITION_TOKEN"),
-        token.clone(),
-    );
+    let secret_data = workload_env::secret_data(&qr.spec, &env_vars, &token, &workload);
 
     create_or_update_secret(ctx, ns, &secret_name, secret_data, claim).await?;
 
@@ -271,26 +284,27 @@ async fn cleanup(claim: &QuantumResourceClaim, ctx: &Arc<Context>) -> Result<()>
         if status.phase == ClaimPhase::Bound {
             let qr_api: Api<QuantumResource> = Api::all(ctx.client.clone());
             if let Ok(qr) = qr_api.get(&claim.spec.quantum_resource).await {
-                let token_key = format!(
-                    "{}_QRMI_JOB_ACQUISITION_TOKEN",
-                    qr.spec.resource_id.to_lowercase().replace('-', "_")
-                );
+                let token_key =
+                    workload_env::env_name(&qr.spec.resource_id, "QRMI_JOB_ACQUISITION_TOKEN");
                 if let Ok(secret) = secrets_api.get(&secret_name).await {
-                    if let Some(data) = &secret.data {
-                        if let Some(token_bytes) = data.get(&token_key) {
-                            if let Ok(token) = String::from_utf8(token_bytes.0.clone()) {
-                                let creds_api: Api<Secret> =
-                                    Api::namespaced(ctx.client.clone(), &ctx.operator_namespace);
-                                let env_vars = acquire::resolve_env_vars(&qr.spec, &creds_api)
-                                    .await
-                                    .unwrap_or_default();
-                                if let Err(e) = acquire::release(&qr.spec, &env_vars, &token).await
-                                {
-                                    warn!(claim = %claim.name_any(), "release failed (continuing cleanup): {e:#}");
-                                } else {
-                                    info!(claim = %claim.name_any(), resource = %claim.spec.quantum_resource, "released quantum resource lock");
-                                }
-                            }
+                    let data: BTreeMap<String, String> = secret
+                        .data
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|(k, v)| String::from_utf8(v.0).ok().map(|v| (k, v)))
+                        .collect();
+                    if let Some(token) = data.get(&token_key) {
+                        let creds_api: Api<Secret> =
+                            Api::namespaced(ctx.client.clone(), &ctx.operator_namespace);
+                        let mut env_vars = acquire::resolve_env_vars(&qr.spec, &creds_api)
+                            .await
+                            .unwrap_or_default();
+                        // The owning Job may be gone by now; the Secret kept its job variables.
+                        env_vars.extend(workload_env::job_env_from_secret(&data));
+                        if let Err(e) = acquire::release(&qr.spec, &env_vars, token).await {
+                            warn!(claim = %claim.name_any(), "release failed (continuing cleanup): {e:#}");
+                        } else {
+                            info!(claim = %claim.name_any(), resource = %claim.spec.quantum_resource, "released quantum resource lock");
                         }
                     }
                 }
@@ -365,6 +379,15 @@ async fn remove_finalizer(
 
 pub fn secret_name_for(claim_name: &str) -> String {
     format!("qrc-{claim_name}")
+}
+
+/// Name of the Job that owns this claim, if the Job controller created it.
+fn owner_job_name(claim: &QuantumResourceClaim) -> Option<String> {
+    claim
+        .owner_references()
+        .iter()
+        .find(|o| o.kind == "Job" && o.api_version == "batch/v1")
+        .map(|o| o.name.clone())
 }
 
 async fn create_or_update_secret(
